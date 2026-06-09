@@ -16,12 +16,13 @@ pub mod persisted_offset;
 pub mod state_writer;
 pub mod watcher;
 
-use ::log::{info, warn};
+use ::log::{error, info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::liveness::{self, LivenessCheck};
@@ -170,6 +171,7 @@ pub fn run_with_config(paths: DaemonPaths, cfg: DaemonConfig) -> Result<(), Stri
         &cfg,
         watcher_offset.clone(),
         home.as_deref(),
+        watcher_handle.as_ref().map(|w| &w.thread),
     );
     liveness_running.store(false, Ordering::SeqCst);
     // Persist the final offset so the next daemon start can resume cleanly.
@@ -255,9 +257,10 @@ fn run_loop(
     cfg: &DaemonConfig,
     watcher_offset: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     home: Option<&Path>,
+    watcher_thread: Option<&JoinHandle<()>>,
 ) -> Result<(), String> {
     let mut threads: HashMap<ThreadKey, ThreadState> = HashMap::new();
-    let mut owners = owners::load(&paths.owners_file).unwrap_or_default();
+    let mut owners = owners::load_or_quarantine(&paths.owners_file);
 
     // Apply initial owners overlay over an empty map (no-op, but consistent).
     apply_owners_overlay(&mut threads, &owners);
@@ -289,14 +292,15 @@ fn run_loop(
                 handle_hook(ev, &mut threads, &owners, &self_tx, cfg);
                 pending_write_at = Some(now + cfg.state_write_debounce);
             }
-            Ok(DaemonEvent::OwnersChanged) => match owners::load(&paths.owners_file) {
-                Ok(new) => {
-                    owners = new;
-                    apply_owners_overlay(&mut threads, &owners);
-                    pending_write_at = Some(now + cfg.state_write_debounce);
-                }
-                Err(e) => warn!("owners.json reload failed: {e}"),
-            },
+            Ok(DaemonEvent::OwnersChanged) => {
+                // Quarantine a corrupt overlay rather than aborting the reload:
+                // the overlay only *sets* tags (never clears), so an empty
+                // result leaves already-applied owners on live threads intact,
+                // and the next `heed owner register` writes a fresh file.
+                owners = owners::load_or_quarantine(&paths.owners_file);
+                apply_owners_overlay(&mut threads, &owners);
+                pending_write_at = Some(now + cfg.state_write_debounce);
+            }
             Ok(DaemonEvent::LivenessTick) => {
                 if poll_liveness(&mut threads, cfg) {
                     pending_write_at = Some(now + cfg.state_write_debounce);
@@ -338,6 +342,19 @@ fn run_loop(
                         pending_write_at = None;
                     }
                 }
+                // Watchdog: if the event-watcher thread has died (panic, or a
+                // notify backend failure), no hook event can ever reach us
+                // again — we'd be a live-but-dead daemon. Flush, persist the
+                // offset, and exit non-zero so the launchd/systemd supervisor
+                // (KeepAlive) restarts us; the fresh daemon resumes from the
+                // persisted offset. Idle timeouts (≤60s) bound the detection
+                // latency. run_once has no watcher thread, so this never fires.
+                if watcher_died(watcher_thread) {
+                    error!("daemon: event watcher thread exited unexpectedly; restarting");
+                    flush_state(&threads, &paths.state_file)?;
+                    persist_watcher_offset(home, watcher_offset.as_ref());
+                    return Err("event watcher thread exited; restart for recovery".into());
+                }
                 if cfg.run_once {
                     // Pending state at the end of run_once still flushes.
                     if pending_write_at.is_none() {
@@ -354,6 +371,14 @@ fn run_loop(
         persist_watcher_offset(home, watcher_offset.as_ref());
     }
     Ok(())
+}
+
+/// Watchdog predicate: true when a watcher thread was spawned but has since
+/// finished. In normal operation the watcher only ends on shutdown (which
+/// breaks the loop before this is checked), so a finished thread here means it
+/// died unexpectedly. `None` (run_once / no watcher) is never "died".
+fn watcher_died(watcher_thread: Option<&JoinHandle<()>>) -> bool {
+    watcher_thread.map(JoinHandle::is_finished).unwrap_or(false)
 }
 
 fn persist_watcher_offset(
@@ -570,6 +595,29 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert!(parsed["threads"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watcher_died_true_only_for_a_finished_thread() {
+        // A thread that has returned → watchdog should report it dead.
+        let finished = std::thread::spawn(|| {});
+        while !finished.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(watcher_died(Some(&finished)));
+
+        // A thread still blocked on a channel → alive.
+        let (keepalive_tx, keepalive_rx) = mpsc::channel::<()>();
+        let running = std::thread::spawn(move || {
+            let _ = keepalive_rx.recv();
+        });
+        assert!(!watcher_died(Some(&running)));
+
+        // No watcher (run_once) → never "died".
+        assert!(!watcher_died(None));
+
+        drop(keepalive_tx);
+        let _ = running.join();
     }
 
     #[test]

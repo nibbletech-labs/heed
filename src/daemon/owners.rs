@@ -12,11 +12,13 @@
 //! }
 //! ```
 
+use ::log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::install::atomic_write;
 use crate::state::{Cli, ThreadKey};
@@ -70,6 +72,45 @@ pub fn load(path: &Path) -> Result<HashMap<ThreadKey, OwnerRecord>, String> {
         out.insert(thread_key, record);
     }
     Ok(out)
+}
+
+/// Load owners for the daemon overlay, self-healing past a corrupt file. On a
+/// malformed `owners.json` the bad file is renamed aside
+/// (`owners.json.corrupt-<unix_ms>`), an error is logged, and an empty overlay
+/// is returned — so a single bad byte can't freeze ownership for every thread
+/// or fail every reload. Already-applied owner tags on live threads survive
+/// (the overlay only sets, never clears), and the next `heed owner register`
+/// writes a fresh file. Missing/empty files are not corrupt and pass through.
+pub fn load_or_quarantine(path: &Path) -> HashMap<ThreadKey, OwnerRecord> {
+    match load(path) {
+        Ok(map) => map,
+        Err(e) => {
+            error!("owners.json unreadable ({e}); quarantining and continuing with no overlay");
+            if let Err(qe) = quarantine(path) {
+                warn!("could not quarantine corrupt owners.json: {qe}");
+            }
+            HashMap::new()
+        }
+    }
+}
+
+/// Move a corrupt file aside to `<name>.corrupt-<unix_ms>`, preserving the bytes
+/// for debugging while letting the daemon continue.
+fn quarantine(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".corrupt-{ts}"));
+    let dest = path.with_file_name(name);
+    fs::rename(path, &dest)
 }
 
 /// Insert or update an owner record. Atomic write.
@@ -153,6 +194,41 @@ mod tests {
         let p = tmp.path().join("owners.json");
         fs::write(&p, "{ not valid").unwrap();
         assert!(load(&p).is_err());
+    }
+
+    #[test]
+    fn load_or_quarantine_moves_corrupt_aside_and_returns_empty() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("owners.json");
+        fs::write(&p, "{ not valid json").unwrap();
+
+        let m = load_or_quarantine(&p);
+        assert!(m.is_empty());
+        assert!(!p.exists(), "corrupt file should have been renamed aside");
+
+        let quarantined: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("owners.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine copy expected");
+    }
+
+    #[test]
+    fn load_or_quarantine_passes_through_valid_and_missing() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("owners.json");
+        // Missing → empty, no quarantine.
+        assert!(load_or_quarantine(&p).is_empty());
+
+        fs::write(&p, r#"{"claude:abc":{"owner_product":"codezilla"}}"#).unwrap();
+        let m = load_or_quarantine(&p);
+        assert_eq!(m.len(), 1);
+        assert!(p.exists(), "valid file must be left in place");
     }
 
     #[test]
