@@ -1,0 +1,7 @@
+target/
+*.swp
+.DS_Store
+
+# Internal planning docs — keep the public repo README-only.
+# (docs/screenshots/ stays tracked: the README embeds the TUI image.)
+docs/*.md

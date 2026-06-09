@@ -1,0 +1,122 @@
+name: Upstream schema drift
+
+# Heed's hook scripts depend on the shape of Claude Code's settings.json and
+# Codex's config.toml hook contracts, plus the set of hook event names those
+# CLIs fire. Those CLIs ship new versions weekly. This job is the early-warning
+# net (Heed's "single biggest stops-working-silently risk"): it installs the
+# *latest* CLIs and checks that Heed's expected hook event names still exist and
+# that `heed install` round-trips cleanly. Zero API spend — no model is invoked.
+#
+# Two tiers:
+#   1. Round-trip (hard fail): `heed install` writes the expected hook
+#      registrations into settings.json / config.toml.
+#   2. Upstream presence: the event names Heed registers still appear in the
+#      latest installed CLI package. Hard fail for Claude Code (bundled JS where
+#      the strings are reliable); warn-only for Codex (ships a compiled binary,
+#      so the grep is best-effort).
+#
+# Event-name source of truth: src/install/claude.rs and src/install/codex.rs.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  schema:
+    name: Hook schema vs latest Claude/Codex CLIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install latest Claude Code + Codex CLIs
+        run: |
+          npm install -g @anthropic-ai/claude-code || echo "::warning::claude-code npm install failed"
+          npm install -g @openai/codex || echo "::warning::codex npm install failed"
+
+      - name: Build heed
+        run: cargo build --release
+
+      - name: heed install into a clean HOME
+        run: |
+          HEED_TEST_HOME="$(mktemp -d)"
+          echo "HEED_TEST_HOME=$HEED_TEST_HOME" >> "$GITHUB_ENV"
+          # Heed only edits a CLI's config if its dir already exists (it won't
+          # fabricate config for a CLI you don't use — install/mod.rs). The
+          # runner HOME is fresh, so create the dirs to exercise the edit path.
+          mkdir -p "$HEED_TEST_HOME/.claude" "$HEED_TEST_HOME/.codex"
+          HOME="$HEED_TEST_HOME" ./target/release/heed install --no-spawn
+
+      - name: Assert hook registrations round-trip and event names still exist upstream
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys, pathlib
+
+          home = pathlib.Path(os.environ["HEED_TEST_HOME"])
+          errors, warnings = [], []
+
+          # Source of truth: src/install/claude.rs and src/install/codex.rs
+          CLAUDE_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+          CODEX_EVENTS  = CLAUDE_EVENTS + ["PermissionRequest"]
+
+          # --- Tier 1: heed install round-trips the expected registrations ---
+          settings = home / ".claude" / "settings.json"
+          if not settings.exists():
+              errors.append(f"{settings} missing after `heed install`")
+          else:
+              data = json.loads(settings.read_text())
+              hooks = data.get("hooks", {})
+              for ev in CLAUDE_EVENTS:
+                  if ev not in hooks:
+                      errors.append(f"claude settings.json missing hook event '{ev}'")
+              if "/.heed/claude-hooks/" not in json.dumps(data):
+                  errors.append("claude settings.json has no command path under ~/.heed/claude-hooks/")
+
+          config = home / ".codex" / "config.toml"
+          if not config.exists():
+              errors.append(f"{config} missing after `heed install`")
+          else:
+              text = config.read_text()
+              for ev in CODEX_EVENTS:
+                  if f"[[hooks.{ev}]]" not in text:
+                      errors.append(f"codex config.toml missing hook table [[hooks.{ev}]]")
+              if "/.heed/codex-hooks/" not in text:
+                  errors.append("codex config.toml has no command path under ~/.heed/codex-hooks/")
+
+          # --- Tier 2: event names still present in the latest installed CLIs ---
+          npm_root = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True).stdout.strip()
+          root = pathlib.Path(npm_root)
+
+          def check_pkg(pkgdir, events, hard):
+              if not pkgdir.exists():
+                  warnings.append(f"{pkgdir.name} not installed; skipping upstream presence check")
+                  return
+              for ev in events:
+                  # -r recursive, -a treat binary as text (Codex ships a binary), -F fixed string
+                  r = subprocess.run(["grep", "-raF", "--", ev, str(pkgdir)],
+                                     capture_output=True)
+                  if r.returncode != 0:
+                      msg = f"hook event '{ev}' not found in {pkgdir.name} (possible upstream rename/removal)"
+                      (errors if hard else warnings).append(msg)
+
+          check_pkg(root / "@anthropic-ai" / "claude-code", CLAUDE_EVENTS, hard=True)
+          check_pkg(root / "@openai" / "codex", CODEX_EVENTS, hard=False)
+
+          for w in warnings:
+              print(f"::warning::{w}")
+          for e in errors:
+              print(f"::error::{e}")
+
+          if errors:
+              print(f"\nFAIL: {len(errors)} drift issue(s) detected.", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: hook schema intact ({len(warnings)} warning(s)).")
+          PY
