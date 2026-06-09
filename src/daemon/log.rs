@@ -21,7 +21,12 @@ pub fn maybe_truncate_event_log(log_path: &Path) -> Result<bool, String> {
     if size <= EVENT_LOG_MAX_BYTES {
         return Ok(false);
     }
-    let raw = fs::read_to_string(log_path).map_err(|e| format!("read {:?}: {}", log_path, e))?;
+    // Decode lossily: a single invalid-UTF-8 byte (a partial/garbled hook
+    // write) must not make truncation fail — that left the oversized, corrupt
+    // log in place and the watcher then wedged on it. Lossy decode replaces bad
+    // bytes with U+FFFD, and rewriting the kept lines scrubs them from disk.
+    let bytes = fs::read(log_path).map_err(|e| format!("read {:?}: {}", log_path, e))?;
+    let raw = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = raw.lines().collect();
     let kept: &[&str] = if lines.len() > EVENT_LOG_KEEP_LINES {
         &lines[lines.len() - EVENT_LOG_KEEP_LINES..]
@@ -86,6 +91,34 @@ mod tests {
         assert!(after_lines[0].starts_with("04000 "));
         // Last is 9999.
         assert!(after_lines.last().unwrap().starts_with("09999 "));
+    }
+
+    #[test]
+    fn truncation_tolerates_invalid_utf8() {
+        // An oversized log containing invalid UTF-8 must still truncate (rather
+        // than erroring and leaving the corrupt file in place). Regression for
+        // the daemon stall: `read_to_string` rejected the whole file.
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+
+        let valid_line = format!("{}\n", "x".repeat(200));
+        let mut buf: Vec<u8> = Vec::new();
+        for i in 0..10_000 {
+            buf.extend_from_slice(format!("{i:05} ").as_bytes());
+            buf.extend_from_slice(valid_line.as_bytes());
+            // Sprinkle in a raw invalid-UTF-8 byte every so often.
+            if i % 500 == 0 {
+                buf.extend_from_slice(&[0xff, 0xfe, b'\n']);
+            }
+        }
+        fs::write(&p, &buf).unwrap();
+        assert!(fs::metadata(&p).unwrap().len() > EVENT_LOG_MAX_BYTES);
+
+        let trimmed = maybe_truncate_event_log(&p).unwrap();
+        assert!(trimmed, "oversized corrupt log should be truncated, not errored");
+        // The rewritten file is valid UTF-8 and within the line cap.
+        let after = fs::read_to_string(&p).expect("rewritten log is valid UTF-8");
+        assert!(after.lines().count() <= EVENT_LOG_KEEP_LINES);
     }
 
     #[test]

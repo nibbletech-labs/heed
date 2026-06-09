@@ -118,11 +118,21 @@ fn drain(log_path: &Path, offset: &mut u64, tx: &Sender<HookEvent>) -> Result<()
     if file.seek(SeekFrom::Start(*offset)).is_err() {
         return Ok(());
     }
-    let mut buf = String::new();
-    if file.read_to_string(&mut buf).is_err() {
+    // Read the span as raw bytes and decode lossily. Reading as a UTF-8 string
+    // (`read_to_string`) fails wholesale on a single invalid byte — and because
+    // the early return left `*offset` un-advanced, every later append re-read
+    // the same corrupt span and the tail wedged permanently (live-but-dead
+    // daemon). Decoding lossily turns bad bytes into U+FFFD so the offending
+    // line just fails JSON parse and is skipped, while the offset still moves on.
+    let to_read = (size - *offset) as usize;
+    let mut bytes = vec![0u8; to_read];
+    if file.read_exact(&mut bytes).is_err() {
+        // Short read (e.g. concurrent truncation): don't advance; the next
+        // drain re-evaluates size (and the `size < *offset` reset recovers).
         return Ok(());
     }
     *offset = size;
+    let buf = String::from_utf8_lossy(&bytes);
 
     for line in buf.lines() {
         if line.trim().is_empty() {
@@ -162,6 +172,16 @@ mod tests {
             .open(file)
             .unwrap();
         writeln!(f, "{line}").unwrap();
+        f.sync_all().unwrap();
+    }
+
+    fn append_raw(file: &Path, bytes: &[u8]) {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+            .unwrap();
+        f.write_all(bytes).unwrap();
         f.sync_all().unwrap();
     }
 
@@ -231,6 +251,32 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("good event should arrive");
         assert_eq!(ev.thread_id, "good");
+    }
+
+    #[test]
+    fn watcher_advances_past_invalid_utf8_and_keeps_delivering() {
+        // Regression for the live-but-dead stall: a single invalid-UTF-8 byte in
+        // events.jsonl used to wedge the tail forever (read_to_string errored and
+        // the offset never advanced). The watcher must skip the bad bytes and
+        // keep delivering subsequent valid events.
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("events.jsonl");
+
+        let (tx, rx) = mpsc::channel();
+        let _w = spawn(log.clone(), 0, tx).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        // A corrupt "line": invalid UTF-8 bytes terminated by a newline.
+        append_raw(&log, &[0x7b, 0xff, 0xfe, 0x6f, 0x6f, b'\n']);
+        write_event(
+            &log,
+            r#"{"event":"turn_start","ts":9.0,"cli":"codex","thread_id":"after-corruption","pid":9,"pid_start":""}"#,
+        );
+
+        let ev = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("event after the corrupt bytes must still be delivered");
+        assert_eq!(ev.thread_id, "after-corruption");
     }
 
     #[test]
