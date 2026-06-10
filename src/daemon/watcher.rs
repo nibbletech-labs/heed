@@ -23,6 +23,11 @@ use crate::state::HookEvent;
 /// coalesce. Cheap — a stat + (usually no-op) read.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How often the watcher checks whether the log is over the size cap. The
+/// daemon also trims on startup, but a long-running daemon never restarts, so
+/// without this the log grows without bound between restarts.
+const TRUNCATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Tail-watch `events.jsonl`, sending each parsed event to `tx`.
 ///
 /// `initial_offset` is what byte we seek to on startup — typically the current
@@ -92,11 +97,38 @@ fn run_loop(
     }
     offset.store(local_offset, Ordering::Relaxed);
 
+    let mut last_truncate_check = std::time::Instant::now();
     while let Ok(_) | Err(RecvTimeoutError::Timeout) = notify_rx.recv_timeout(POLL_INTERVAL) {
         if drain(log_path, &mut local_offset, &tx).is_err() {
             break;
         }
+        if last_truncate_check.elapsed() >= TRUNCATE_CHECK_INTERVAL {
+            last_truncate_check = std::time::Instant::now();
+            maybe_truncate(log_path, &mut local_offset);
+        }
         offset.store(local_offset, Ordering::Relaxed);
+    }
+}
+
+/// Trim the log if it is over the cap, then jump the offset to the new EOF.
+/// Runs in the watcher thread — the sole owner of the offset — so the rewrite
+/// can't race a concurrent reader into replaying the kept suffix (`drain` has
+/// already consumed every kept line; they are a suffix of what we just read).
+/// Hook appends between the trim's read and its rename are dropped, the same
+/// ~ms window the startup trim accepts.
+fn maybe_truncate(log_path: &Path, offset: &mut u64) {
+    // Only trim when fully drained: after a short read `drain` leaves the
+    // offset behind EOF, and jumping it forward would skip those events.
+    if current_eof(log_path) != *offset {
+        return;
+    }
+    match super::log::maybe_truncate_event_log(log_path) {
+        Ok(true) => {
+            *offset = current_eof(log_path);
+            debug!("event log trimmed; offset reset to {offset}");
+        }
+        Ok(false) => {}
+        Err(e) => warn!("periodic event log truncation failed: {e}"),
     }
 }
 
@@ -277,6 +309,43 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("event after the corrupt bytes must still be delivered");
         assert_eq!(ev.thread_id, "after-corruption");
+    }
+
+    #[test]
+    fn maybe_truncate_trims_oversized_log_and_jumps_offset() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("events.jsonl");
+        let line = format!("{}\n", "x".repeat(440));
+        let mut buf = String::new();
+        for _ in 0..7_000 {
+            buf.push_str(&line);
+        }
+        fs::write(&log, &buf).unwrap();
+
+        // Fully drained watcher → trims, offset lands on the new EOF.
+        let mut offset = current_eof(&log);
+        maybe_truncate(&log, &mut offset);
+        let new_size = current_eof(&log);
+        assert!(new_size < buf.len() as u64);
+        assert_eq!(offset, new_size);
+    }
+
+    #[test]
+    fn maybe_truncate_is_noop_when_not_fully_drained() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("events.jsonl");
+        let line = format!("{}\n", "x".repeat(440));
+        let mut buf = String::new();
+        for _ in 0..7_000 {
+            buf.push_str(&line);
+        }
+        fs::write(&log, &buf).unwrap();
+
+        // Offset behind EOF (short read) → must not trim or move the offset.
+        let mut offset = 10;
+        maybe_truncate(&log, &mut offset);
+        assert_eq!(offset, 10);
+        assert_eq!(current_eof(&log), buf.len() as u64);
     }
 
     #[test]
