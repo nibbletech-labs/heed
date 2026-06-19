@@ -324,6 +324,8 @@ pub fn apply_event(mut state: ThreadState, ev: &HookEvent) -> ThreadState {
         HookEventKind::SessionEnd => {
             // v0.2 fast-path: clean exit → immediately gone, no polling.
             state.liveness = Liveness::Gone;
+            // A dead thread isn't working — don't leave activity frozen mid-turn.
+            state.activity = Activity::Idle;
         }
     }
 

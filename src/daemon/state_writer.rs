@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::install::atomic_write;
-use crate::state::ThreadState;
+use crate::state::{Activity, Liveness, ThreadState};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -37,7 +37,16 @@ pub fn now_unix() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn build_state_file(threads: HashMap<String, ThreadState>) -> StateFile {
+pub fn build_state_file(mut threads: HashMap<String, ThreadState>) -> StateFile {
+    // Backstop the gone => idle invariant at the one chokepoint every write
+    // passes through, so a future transition path that forgets to clear activity
+    // can never persist a `working`/`gone` thread (which renders as a stuck
+    // spinner in consumers like Codezilla).
+    for state in threads.values_mut() {
+        if state.liveness == Liveness::Gone && state.activity != Activity::Idle {
+            state.activity = Activity::Idle;
+        }
+    }
     StateFile {
         schema_version: SCHEMA_VERSION,
         updated_at: now_unix(),

@@ -470,6 +470,8 @@ fn poll_liveness(threads: &mut HashMap<ThreadKey, ThreadState>, cfg: &DaemonConf
         state.last_check = now_unix;
         if matches!(result, LivenessCheck::Gone) && state.liveness != Liveness::Gone {
             state.liveness = Liveness::Gone;
+            // A dead thread isn't working — don't leave activity frozen mid-turn.
+            state.activity = Activity::Idle;
             state.subtitle = Some(tool_display::format_for_thread(state));
             changed = true;
         }
