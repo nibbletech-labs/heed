@@ -120,6 +120,22 @@ pub fn register(path: &Path, cli: Cli, thread_id: &str, record: OwnerRecord) -> 
     write(path, &current)
 }
 
+/// Move an owner record from one native session to another in a single atomic
+/// write, so the overlay never momentarily names both (a consumer would flap
+/// between them) or neither (the thread would vanish from its product).
+pub fn transfer(
+    path: &Path,
+    cli: Cli,
+    from_thread_id: &str,
+    to_thread_id: &str,
+    record: OwnerRecord,
+) -> Result<(), String> {
+    let mut current = load(path).unwrap_or_default();
+    current.remove(&(cli, from_thread_id.to_string()));
+    current.insert((cli, to_thread_id.to_string()), record);
+    write(path, &current)
+}
+
 /// Remove an owner entry. No-op if it doesn't exist. Atomic write.
 pub fn unregister(path: &Path, cli: Cli, thread_id: &str) -> Result<bool, String> {
     let mut current = load(path).unwrap_or_default();

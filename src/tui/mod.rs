@@ -431,6 +431,8 @@ mod tests {
             transcript_path: None,
             owner_product: None,
             owner_thread_id: None,
+            supersedes: None,
+            superseded_by: None,
             recent_events: VecDeque::new(),
         }
     }

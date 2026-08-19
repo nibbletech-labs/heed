@@ -31,6 +31,8 @@ fn dummy_thread(id: &str) -> ThreadState {
         transcript_path: None,
         owner_product: None,
         owner_thread_id: None,
+        supersedes: None,
+        superseded_by: None,
         recent_events: Default::default(),
     }
 }

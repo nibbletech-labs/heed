@@ -30,6 +30,7 @@ use crate::state::{
     apply_event, initial_state, Activity, HookEvent, HookEventKind, Liveness, ThreadKey,
     ThreadState,
 };
+use crate::succession;
 use crate::tool_display;
 use crate::transcript;
 
@@ -43,6 +44,10 @@ const STATE_WRITE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Delay between TurnEnd and the post-Stop transcript scan, giving Claude
 /// time to flush the final assistant entry to disk.
 const POST_STOP_SCAN_DELAY: Duration = Duration::from_millis(200);
+/// How long a thread holding the owner overlay must stay hook-silent before a
+/// successor session takes it over.
+const OWNER_TAKEOVER_GRACE: Duration =
+    Duration::from_secs(succession::OWNER_TAKEOVER_GRACE_SECS as u64);
 
 #[derive(Clone, Debug)]
 pub struct DaemonPaths {
@@ -61,6 +66,7 @@ pub struct DaemonConfig {
     pub liveness_event_grace: Duration,
     pub state_write_debounce: Duration,
     pub post_stop_scan_delay: Duration,
+    pub owner_takeover_grace: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -71,6 +77,7 @@ impl Default for DaemonConfig {
             liveness_event_grace: LIVENESS_EVENT_GRACE,
             state_write_debounce: STATE_WRITE_DEBOUNCE,
             post_stop_scan_delay: POST_STOP_SCAN_DELAY,
+            owner_takeover_grace: OWNER_TAKEOVER_GRACE,
         }
     }
 }
@@ -261,6 +268,9 @@ fn run_loop(
 ) -> Result<(), String> {
     let mut threads: HashMap<ThreadKey, ThreadState> = HashMap::new();
     let mut owners = owners::load_or_quarantine(&paths.owners_file);
+    // Used to age out succession decisions that rest on a thread's *absence*
+    // from `threads`, which is meaningless in the first moments after startup.
+    let started_at = state_writer::now_unix();
 
     // Apply initial owners overlay over an empty map (no-op, but consistent).
     apply_owners_overlay(&mut threads, &owners);
@@ -289,7 +299,15 @@ fn run_loop(
 
         match recv_result {
             Ok(DaemonEvent::Hook(ev)) => {
-                handle_hook(ev, &mut threads, &owners, &self_tx, cfg);
+                handle_hook(
+                    ev,
+                    &mut threads,
+                    &mut owners,
+                    &paths.owners_file,
+                    started_at,
+                    &self_tx,
+                    cfg,
+                );
                 pending_write_at = Some(now + cfg.state_write_debounce);
             }
             Ok(DaemonEvent::OwnersChanged) => {
@@ -397,14 +415,31 @@ fn persist_watcher_offset(
 fn handle_hook(
     ev: HookEvent,
     threads: &mut HashMap<ThreadKey, ThreadState>,
-    owners: &HashMap<ThreadKey, owners::OwnerRecord>,
+    owners: &mut HashMap<ThreadKey, owners::OwnerRecord>,
+    owners_file: &Path,
+    started_at: f64,
     self_tx: &Sender<DaemonEvent>,
     cfg: &DaemonConfig,
 ) {
     let key = ev.key();
 
+    let known = threads.contains_key(&key);
     let current = threads.remove(&key).unwrap_or_else(|| initial_state(&ev));
     let mut next = apply_event(current, &ev);
+
+    // First sighting of a session id: decide whether it continues one we already
+    // track (a forked or in-place-rotated session). This reads the live process,
+    // so it has to happen now — once the predecessor exits, the link is gone.
+    if !known {
+        if let Some(parent_key) = succession::resolve_predecessor(&ev, threads, owners) {
+            next.supersedes = Some(parent_key.1.clone());
+            if let Some(parent) = threads.get_mut(&parent_key) {
+                parent.superseded_by = Some(next.thread_id.clone());
+                parent.subtitle = Some(tool_display::format_for_thread(parent));
+            }
+            info!("succession: {} continues {}", next.thread_id, parent_key.1);
+        }
+    }
 
     // Owner overlay.
     if let Some(rec) = owners.get(&key) {
@@ -422,6 +457,11 @@ fn handle_hook(
     let needs_post_stop = matches!(ev.event, HookEventKind::TurnEnd);
     threads.insert(key.clone(), next);
 
+    // Re-checked on every event, not just the first: at the moment a session
+    // forks, its predecessor has only just stopped emitting, so the handoff is
+    // rarely provable yet.
+    transfer_owner_to_successor(&key, threads, owners, owners_file, started_at, cfg);
+
     if needs_post_stop {
         let tx = self_tx.clone();
         let delay = cfg.post_stop_scan_delay;
@@ -432,6 +472,89 @@ fn handle_hook(
                 let _ = tx.send(DaemonEvent::PostStopScan { key });
             })
             .expect("spawn post-stop thread");
+    }
+}
+
+/// Hand the owner overlay to `key` when it has superseded the thread currently
+/// holding it. Ownership *moves*: a product's thread id must name exactly one
+/// native session, or a consumer diffing state.json would flap between the
+/// superseded record's frozen activity and the live one's.
+fn transfer_owner_to_successor(
+    key: &ThreadKey,
+    threads: &mut HashMap<ThreadKey, ThreadState>,
+    owners: &mut HashMap<ThreadKey, owners::OwnerRecord>,
+    owners_file: &Path,
+    started_at: f64,
+    cfg: &DaemonConfig,
+) {
+    let Some(child) = threads.get(key) else {
+        return;
+    };
+    let Some(parent_id) = child.supersedes.clone() else {
+        return;
+    };
+    let parent_key: ThreadKey = (child.cli, parent_id);
+    let now = state_writer::now_unix();
+    let grace = cfg.owner_takeover_grace.as_secs_f64();
+
+    let record = match threads.get(&parent_key) {
+        Some(parent) => {
+            if !succession::should_take_ownership(parent, child, now, grace) {
+                return;
+            }
+            owners::OwnerRecord {
+                owner_product: parent.owner_product.clone(),
+                owner_thread_id: parent.owner_thread_id.clone(),
+                cwd: child.cwd.clone().or_else(|| parent.cwd.clone()),
+            }
+        }
+        // The predecessor isn't tracked at all, so it hasn't emitted since this
+        // daemon started and cannot be the live end of the conversation. Its
+        // overlay is still the persistent record of who owns the thread. Wait
+        // out the grace from startup first, so a daemon that restarted while a
+        // session was mid-turn doesn't mistake it for an abandoned one.
+        None => {
+            let Some(rec) = owners.get(&parent_key) else {
+                return;
+            };
+            if now - started_at < grace {
+                return;
+            }
+            owners::OwnerRecord {
+                owner_product: rec.owner_product.clone(),
+                owner_thread_id: rec.owner_thread_id.clone(),
+                cwd: child.cwd.clone().or_else(|| rec.cwd.clone()),
+            }
+        }
+    };
+    if record.owner_product.is_none() && record.owner_thread_id.is_none() {
+        return;
+    }
+    if let Err(e) = owners::transfer(owners_file, key.0, &parent_key.1, &key.1, record.clone()) {
+        warn!("succession: could not move owner overlay to {}: {e}", key.1);
+        return;
+    }
+    info!(
+        "succession: owner {} moved from {} to {}",
+        record.owner_thread_id.as_deref().unwrap_or("?"),
+        parent_key.1,
+        key.1
+    );
+
+    // Mirror the write into the in-memory overlay so an event arriving before
+    // the owners.json watcher fires can't re-tag the predecessor.
+    owners.remove(&parent_key);
+    owners.insert(key.clone(), record.clone());
+
+    if let Some(parent) = threads.get_mut(&parent_key) {
+        parent.owner_product = None;
+        parent.owner_thread_id = None;
+        parent.subtitle = Some(tool_display::format_for_thread(parent));
+    }
+    if let Some(child) = threads.get_mut(key) {
+        child.owner_product = record.owner_product;
+        child.owner_thread_id = record.owner_thread_id;
+        child.subtitle = Some(tool_display::format_for_thread(child));
     }
 }
 
@@ -488,7 +611,9 @@ fn flush_state(threads: &HashMap<ThreadKey, ThreadState>, state_path: &Path) -> 
 }
 
 /// Process events from a slice without spawning any threads. Used by tests
-/// and as a building block for non-daemon CLI paths.
+/// and as a building block for non-daemon CLI paths. Deliberately skips
+/// succession: linking a session to the one it continues reads the live
+/// process, which a replay of historical events can't do.
 pub fn run_events_in_memory(
     events: Vec<HookEvent>,
     owners: HashMap<ThreadKey, owners::OwnerRecord>,
@@ -534,6 +659,156 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// A session rotating its id in place must carry its product ownership
+    /// across, or the consumer keeps watching the abandoned id and shows the
+    /// thread idle while the work continues.
+    #[test]
+    fn successor_takes_over_the_owner_overlay() {
+        const PARENT: &str = "c7df16c4-a60a-4f11-a3ec-3afd5e15aaed";
+        const CHILD: &str = "e033bfc1-a5dc-4fa4-806b-4040d1e9716f";
+        let dir = tempdir().unwrap();
+        let owners_file = dir.path().join("owners.json");
+        let record = owners::OwnerRecord {
+            owner_product: Some("codezilla".into()),
+            owner_thread_id: Some("cz-48".into()),
+            cwd: Some("/repo".into()),
+        };
+        owners::register(&owners_file, Cli::Claude, PARENT, record.clone()).unwrap();
+
+        let mut threads = HashMap::new();
+        let mut owner_map = owners::load(&owners_file).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let cfg = DaemonConfig::default();
+
+        // Same pid and start time, new session id — an in-place rotation.
+        for (ts, id) in [(1.0, PARENT), (2.0, CHILD)] {
+            handle_hook(
+                ev(HookEventKind::ToolUse, ts, Cli::Claude, id, Some("Bash")),
+                &mut threads,
+                &mut owner_map,
+                &owners_file,
+                0.0,
+                &tx,
+                &cfg,
+            );
+        }
+
+        let parent = &threads[&(Cli::Claude, PARENT.to_string())];
+        let child = &threads[&(Cli::Claude, CHILD.to_string())];
+        assert_eq!(parent.superseded_by.as_deref(), Some(CHILD));
+        assert_eq!(child.supersedes.as_deref(), Some(PARENT));
+        assert_eq!(child.owner_thread_id.as_deref(), Some("cz-48"));
+        assert_eq!(child.owner_product.as_deref(), Some("codezilla"));
+        assert!(
+            parent.owner_thread_id.is_none() && parent.owner_product.is_none(),
+            "ownership must move, not duplicate"
+        );
+
+        let on_disk = owners::load(&owners_file).unwrap();
+        assert!(!on_disk.contains_key(&(Cli::Claude, PARENT.to_string())));
+        assert_eq!(
+            on_disk[&(Cli::Claude, CHILD.to_string())]
+                .owner_thread_id
+                .as_deref(),
+            Some("cz-48")
+        );
+    }
+
+    /// After a restart the predecessor is no longer in memory, but its overlay
+    /// persists in owners.json. A handoff that happened while the daemon was
+    /// down has to stay recoverable, or the thread is stranded for good.
+    #[test]
+    fn successor_claims_ownership_from_an_untracked_predecessor() {
+        const PARENT: &str = "c7df16c4-a60a-4f11-a3ec-3afd5e15aaed";
+        const CHILD: &str = "e033bfc1-a5dc-4fa4-806b-4040d1e9716f";
+        let dir = tempdir().unwrap();
+        let owners_file = dir.path().join("owners.json");
+        owners::register(
+            &owners_file,
+            Cli::Claude,
+            PARENT,
+            owners::OwnerRecord {
+                owner_product: Some("codezilla".into()),
+                owner_thread_id: Some("cz-48".into()),
+                cwd: Some("/repo".into()),
+            },
+        )
+        .unwrap();
+        let mut owner_map = owners::load(&owners_file).unwrap();
+
+        let mut threads = HashMap::new();
+        let key = (Cli::Claude, CHILD.to_string());
+        let mut child = initial_state(&ev(
+            HookEventKind::ToolUse,
+            10.0,
+            Cli::Claude,
+            CHILD,
+            Some("Bash"),
+        ));
+        child.supersedes = Some(PARENT.to_string());
+        threads.insert(key.clone(), child);
+
+        let cfg = DaemonConfig::default();
+        // Startup grace not yet elapsed: the predecessor's silence proves
+        // nothing this soon after boot.
+        transfer_owner_to_successor(
+            &key,
+            &mut threads,
+            &mut owner_map,
+            &owners_file,
+            state_writer::now_unix(),
+            &cfg,
+        );
+        assert!(threads[&key].owner_thread_id.is_none());
+
+        // Long enough after startup, the silence is meaningful.
+        transfer_owner_to_successor(&key, &mut threads, &mut owner_map, &owners_file, 0.0, &cfg);
+        assert_eq!(threads[&key].owner_thread_id.as_deref(), Some("cz-48"));
+        assert_eq!(threads[&key].owner_product.as_deref(), Some("codezilla"));
+
+        let on_disk = owners::load(&owners_file).unwrap();
+        assert!(!on_disk.contains_key(&(Cli::Claude, PARENT.to_string())));
+        assert!(on_disk.contains_key(&key));
+    }
+
+    /// An unowned session that rotates gets linked, but there is no overlay to
+    /// move and nothing is invented for it.
+    #[test]
+    fn succession_without_ownership_links_but_transfers_nothing() {
+        let dir = tempdir().unwrap();
+        let owners_file = dir.path().join("owners.json");
+        let mut threads = HashMap::new();
+        let mut owner_map = HashMap::new();
+        let (tx, _rx) = mpsc::channel();
+        let cfg = DaemonConfig::default();
+
+        for (ts, id) in [(1.0, "aaa"), (2.0, "bbb")] {
+            handle_hook(
+                ev(HookEventKind::ToolUse, ts, Cli::Claude, id, Some("Bash")),
+                &mut threads,
+                &mut owner_map,
+                &owners_file,
+                0.0,
+                &tx,
+                &cfg,
+            );
+        }
+
+        assert_eq!(
+            threads[&(Cli::Claude, "bbb".to_string())]
+                .supersedes
+                .as_deref(),
+            Some("aaa")
+        );
+        assert!(threads[&(Cli::Claude, "bbb".to_string())]
+            .owner_thread_id
+            .is_none());
+        assert!(
+            !owners_file.exists(),
+            "no overlay write for an unowned lineage"
+        );
     }
 
     #[test]

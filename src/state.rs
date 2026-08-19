@@ -86,6 +86,15 @@ pub struct ThreadState {
     pub transcript_path: Option<String>,
     pub owner_product: Option<String>,
     pub owner_thread_id: Option<String>,
+    /// Native session id of the thread this one continues, when a CLI rotated
+    /// its session id mid-conversation. See [`crate::succession`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Native session id of the thread that continued this one. Set on the
+    /// predecessor once a successor is linked; a consumer should follow this to
+    /// the tip rather than reading a superseded record's frozen activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     /// Last N hook events for `heed tui` detail pane. Bounded by
     /// [`RECENT_EVENTS_CAP`]; oldest entries drop off as new ones land.
     #[serde(default)]
@@ -198,6 +207,8 @@ pub fn initial_state(ev: &HookEvent) -> ThreadState {
         transcript_path,
         owner_product: None,
         owner_thread_id: None,
+        supersedes: None,
+        superseded_by: None,
         recent_events: VecDeque::with_capacity(RECENT_EVENTS_CAP),
     }
 }

@@ -265,6 +265,8 @@ mod tests {
             transcript_path: None,
             owner_product: owner.map(|_| "muxra".into()),
             owner_thread_id: owner.map(|s| s.into()),
+            supersedes: None,
+            superseded_by: None,
             recent_events: Default::default(),
         }
     }
@@ -304,6 +306,8 @@ mod tests {
             transcript_path: None,
             owner_product: None,
             owner_thread_id: None,
+            supersedes: None,
+            superseded_by: None,
             recent_events: Default::default(),
         };
         let idle_new = make(Activity::Idle, 100.0);

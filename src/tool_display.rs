@@ -343,6 +343,8 @@ mod tests {
             transcript_path: None,
             owner_product: None,
             owner_thread_id: None,
+            supersedes: None,
+            superseded_by: None,
             recent_events: Default::default(),
         };
         assert_eq!(format_for_thread(&state), "Awaiting input");
@@ -375,6 +377,8 @@ mod tests {
             transcript_path: None,
             owner_product: None,
             owner_thread_id: None,
+            supersedes: None,
+            superseded_by: None,
             recent_events: Default::default(),
         };
         assert_eq!(format_for_thread(&state), "Plan mode · Reading foo.rs");
