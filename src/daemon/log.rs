@@ -104,7 +104,11 @@ mod tests {
         // The newest suffix is what survives.
         assert!(after_lines.last().unwrap().starts_with("09999 "));
         // Each kept line is ~207 bytes, so the byte budget keeps ~2500 lines.
-        assert!(after_lines.len() > 2_000, "kept {} lines", after_lines.len());
+        assert!(
+            after_lines.len() > 2_000,
+            "kept {} lines",
+            after_lines.len()
+        );
     }
 
     #[test]
@@ -150,7 +154,10 @@ mod tests {
         assert!(fs::metadata(&p).unwrap().len() > EVENT_LOG_MAX_BYTES);
 
         let trimmed = maybe_truncate_event_log(&p).unwrap();
-        assert!(trimmed, "oversized corrupt log should be truncated, not errored");
+        assert!(
+            trimmed,
+            "oversized corrupt log should be truncated, not errored"
+        );
         // The rewritten file is valid UTF-8 and within the line cap.
         let after = fs::read_to_string(&p).expect("rewritten log is valid UTF-8");
         assert!(after.lines().count() <= EVENT_LOG_KEEP_LINES);
