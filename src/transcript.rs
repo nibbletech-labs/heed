@@ -79,6 +79,94 @@ pub fn last_assistant_text(transcript_path: &Path) -> Option<String> {
     None
 }
 
+/// Incremental reviewer metadata, owned by the background scan worker.
+#[derive(Default)]
+pub struct ReviewerCache {
+    entries: std::collections::HashMap<std::path::PathBuf, ReviewerEntry>,
+}
+
+#[derive(Default)]
+struct ReviewerEntry {
+    identity: (u64, u64),
+    offset: u64,
+    observed_len: u64,
+    boundary: Vec<u8>,
+    auto_review: bool,
+}
+
+impl ReviewerCache {
+    pub fn uses_auto_review(&mut self, path: &Path) -> bool {
+        self.read(path).unwrap_or_else(|_| {
+            self.entries.remove(path);
+            false
+        })
+    }
+
+    fn read(&mut self, path: &Path) -> std::io::Result<bool> {
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        let mut file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        let entry = self.entries.entry(path.to_path_buf()).or_default();
+        // Detect an in-place rewrite that has already grown past our cursor,
+        // as well as ordinary truncation and atomic replacement.
+        let mut boundary_changed = false;
+        if entry.identity == identity
+            && metadata.len() >= entry.offset
+            && !entry.boundary.is_empty()
+        {
+            file.seek(SeekFrom::Start(entry.offset - entry.boundary.len() as u64))?;
+            let mut boundary = vec![0; entry.boundary.len()];
+            file.read_exact(&mut boundary)?;
+            boundary_changed = boundary != entry.boundary;
+        }
+        if entry.identity != identity || metadata.len() < entry.observed_len || boundary_changed {
+            *entry = ReviewerEntry {
+                identity,
+                ..Default::default()
+            };
+        }
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let count = reader.read_until(b'\n', &mut line)?;
+            if count == 0 {
+                break;
+            }
+            // Most records are tools/output. Avoid allocating a JSON tree for
+            // them, especially multi-megabyte embedded images.
+            if line
+                .windows(b"turn_context".len())
+                .any(|w| w == b"turn_context")
+            {
+                if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+                    if value.get("type").and_then(Value::as_str) == Some("turn_context") {
+                        entry.auto_review = value
+                            .pointer("/payload/approvals_reviewer")
+                            .and_then(Value::as_str)
+                            == Some("auto_review");
+                    }
+                }
+            }
+            // Retry the final incomplete record after the writer appends.
+            if line.last() != Some(&b'\n') {
+                break;
+            }
+            entry.offset += count as u64;
+        }
+        let mut file = reader.into_inner();
+        let size = entry.offset.min(256) as usize;
+        entry.boundary.resize(size, 0);
+        file.seek(SeekFrom::Start(entry.offset - size as u64))?;
+        file.read_exact(&mut entry.boundary)?;
+        entry.observed_len = metadata.len();
+        Ok(entry.auto_review)
+    }
+}
+
 /// Run the post-Stop scan for a Claude transcript. Retries once after
 /// `RETRY_DELAY_MS` if the transcript hasn't been flushed yet (SPEC §4.2 edge).
 pub fn scan_post_stop(transcript_path: &Path) -> PostStopResult {
@@ -105,6 +193,103 @@ mod tests {
         }
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn auto_review_uses_latest_context_across_read_boundaries() {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut cache = ReviewerCache::default();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context",
+            "payload":{"approvals_reviewer":"auto_review"}})
+        )
+        .unwrap();
+        // One oversized record and enough ordinary records to cross chunks.
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"other", "text":"x".repeat(100_000)})
+        )
+        .unwrap();
+        for _ in 0..5000 {
+            writeln!(file, "{{\"type\":\"other\"}}").unwrap();
+        }
+        assert!(cache.uses_auto_review(file.path()));
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context",
+            "payload":{"approvals_reviewer":"user"}})
+        )
+        .unwrap();
+        assert!(!cache.uses_auto_review(file.path()));
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context", "payload":{}})
+        )
+        .unwrap();
+        assert!(!cache.uses_auto_review(file.path()));
+    }
+
+    #[test]
+    fn reviewer_cache_reads_appends_and_retries_partial_records() {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut cache = ReviewerCache::default();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context",
+            "payload":{"approvals_reviewer":"auto_review"}})
+        )
+        .unwrap();
+        assert!(cache.uses_auto_review(file.path()));
+        let offset = cache.entries[file.path()].offset;
+        assert!(cache.uses_auto_review(file.path()));
+        assert_eq!(cache.entries[file.path()].offset, offset);
+        write!(file, "{{\"type\":\"turn_context\",\"payload\":").unwrap();
+        assert!(cache.uses_auto_review(file.path()));
+        assert_eq!(cache.entries[file.path()].offset, offset);
+        writeln!(file, "{{\"approvals_reviewer\":\"user\"}}}}").unwrap();
+        assert!(!cache.uses_auto_review(file.path()));
+        assert_eq!(
+            cache.entries[file.path()].offset,
+            file.as_file().metadata().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn reviewer_cache_resets_on_truncation_replacement_and_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let auto = serde_json::json!({"type":"turn_context",
+            "payload":{"approvals_reviewer":"auto_review"}})
+        .to_string()
+            + "\n";
+        let mut cache = ReviewerCache::default();
+        fs::write(&path, &auto).unwrap();
+        assert!(cache.uses_auto_review(&path));
+        fs::write(&path, "{}\n").unwrap();
+        assert!(!cache.uses_auto_review(&path));
+        fs::write(&path, &auto).unwrap();
+        assert!(cache.uses_auto_review(&path));
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, "{}\n".repeat(100)).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!(!cache.uses_auto_review(&path));
+        fs::remove_file(&path).unwrap();
+        assert!(!cache.uses_auto_review(&path));
+        assert!(!cache.entries.contains_key(&path));
+    }
+
+    #[test]
+    fn auto_review_unknown_transcript_is_not_assumed() {
+        let mut cache = ReviewerCache::default();
+        let file = NamedTempFile::new().unwrap();
+        assert!(!cache.uses_auto_review(file.path()));
+        assert!(!cache.uses_auto_review(Path::new("/nonexistent/heed-transcript")));
     }
 
     #[test]

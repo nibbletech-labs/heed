@@ -96,8 +96,69 @@ pub enum DaemonEvent {
     PostStopScan {
         key: ThreadKey,
     },
+    ReviewerScanned {
+        key: ThreadKey,
+        ts: f64,
+        auto_review: bool,
+    },
     /// SIGINT / SIGTERM received.
     Shutdown,
+}
+
+struct ReviewerRequest {
+    key: ThreadKey,
+    ts: f64,
+    path: PathBuf,
+}
+
+/// One worker owns the cache; transcript I/O never blocks the reducer.
+fn reviewer_worker(results: Sender<DaemonEvent>) -> Sender<ReviewerRequest> {
+    let (tx, rx) = mpsc::channel::<ReviewerRequest>();
+    std::thread::Builder::new()
+        .name("heed-reviewer".into())
+        .spawn(move || {
+            let mut cache = transcript::ReviewerCache::default();
+            for request in rx {
+                let auto_review = cache.uses_auto_review(&request.path);
+                if results
+                    .send(DaemonEvent::ReviewerScanned {
+                        key: request.key,
+                        ts: request.ts,
+                        auto_review,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("spawn reviewer worker");
+    tx
+}
+
+fn apply_reviewer_result(state: &mut ThreadState, ts: f64, auto_review: bool) -> bool {
+    // A tool start/completion, newer permission, turn boundary, or dead process
+    // supersedes this lookup. Never let a delayed scan undo newer activity.
+    if state.last_event != ts
+        || state.liveness != Liveness::Live
+        || !state
+            .recent_events
+            .back()
+            .map(|e| {
+                e.event == HookEventKind::PreToolUse
+                    && e.tool_name.as_deref() == Some("PermissionRequest")
+            })
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    state.activity = if auto_review {
+        Activity::Working
+    } else {
+        Activity::AwaitingInput
+    };
+    state.subtitle = Some(tool_display::format_for_thread(state));
+    true
 }
 
 /// Run the daemon in the foreground. Returns when shutdown is requested.
@@ -278,6 +339,7 @@ fn run_loop(
     // Initial write so consumers can poll state.json immediately.
     flush_state(&threads, &paths.state_file)?;
 
+    let reviewer = reviewer_worker(self_tx.clone());
     let mut pending_write_at: Option<Instant> = None;
 
     loop {
@@ -306,9 +368,21 @@ fn run_loop(
                     &paths.owners_file,
                     started_at,
                     &self_tx,
+                    Some(&reviewer),
                     cfg,
                 );
                 pending_write_at = Some(now + cfg.state_write_debounce);
+            }
+            Ok(DaemonEvent::ReviewerScanned {
+                key,
+                ts,
+                auto_review,
+            }) => {
+                if let Some(state) = threads.get_mut(&key) {
+                    if apply_reviewer_result(state, ts, auto_review) {
+                        pending_write_at = Some(now + cfg.state_write_debounce);
+                    }
+                }
             }
             Ok(DaemonEvent::OwnersChanged) => {
                 // Quarantine a corrupt overlay rather than aborting the reload:
@@ -412,6 +486,7 @@ fn persist_watcher_offset(
     let _ = persisted_offset::save(home, &state);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_hook(
     ev: HookEvent,
     threads: &mut HashMap<ThreadKey, ThreadState>,
@@ -419,6 +494,7 @@ fn handle_hook(
     owners_file: &Path,
     started_at: f64,
     self_tx: &Sender<DaemonEvent>,
+    reviewer: Option<&Sender<ReviewerRequest>>,
     cfg: &DaemonConfig,
 ) {
     let key = ev.key();
@@ -426,6 +502,26 @@ fn handle_hook(
     let known = threads.contains_key(&key);
     let current = threads.remove(&key).unwrap_or_else(|| initial_state(&ev));
     let mut next = apply_event(current, &ev);
+
+    // Hold the working state while a background lookup distinguishes an
+    // automatic review from a human permission prompt.
+    if ev.cli == crate::state::Cli::Codex
+        && ev.event == HookEventKind::PreToolUse
+        && ev.tool_name() == Some("PermissionRequest")
+    {
+        if let (Some(reviewer), Some(path)) = (reviewer, next.transcript_path.as_ref()) {
+            if reviewer
+                .send(ReviewerRequest {
+                    key: key.clone(),
+                    ts: ev.ts,
+                    path: PathBuf::from(path),
+                })
+                .is_ok()
+            {
+                next.activity = Activity::Working;
+            }
+        }
+    }
 
     // First sighting of a session id: decide whether it continues one we already
     // track (a forked or in-place-rotated session). This reads the live process,
@@ -691,6 +787,7 @@ mod tests {
                 &owners_file,
                 0.0,
                 &tx,
+                None,
                 &cfg,
             );
         }
@@ -792,6 +889,7 @@ mod tests {
                 &owners_file,
                 0.0,
                 &tx,
+                None,
                 &cfg,
             );
         }
@@ -809,6 +907,105 @@ mod tests {
             !owners_file.exists(),
             "no overlay write for an unowned lineage"
         );
+    }
+
+    #[test]
+    fn delayed_reviewer_result_cannot_overwrite_newer_activity() {
+        let permission = ev(
+            HookEventKind::PreToolUse,
+            1.0,
+            Cli::Codex,
+            "a",
+            Some("PermissionRequest"),
+        );
+        let pending = apply_event(initial_state(&permission), &permission);
+        for event in [
+            ev(
+                HookEventKind::PreToolUse,
+                2.0,
+                Cli::Codex,
+                "a",
+                Some("Bash"),
+            ),
+            ev(HookEventKind::ToolUse, 2.0, Cli::Codex, "a", Some("Bash")),
+            ev(HookEventKind::TurnStart, 2.0, Cli::Codex, "a", None),
+            ev(HookEventKind::TurnEnd, 2.0, Cli::Codex, "a", None),
+            ev(HookEventKind::SessionEnd, 2.0, Cli::Codex, "a", None),
+            ev(
+                HookEventKind::PreToolUse,
+                2.0,
+                Cli::Codex,
+                "a",
+                Some("PermissionRequest"),
+            ),
+        ] {
+            let mut state = apply_event(pending.clone(), &event);
+            let before = state.activity;
+            assert!(!apply_reviewer_result(&mut state, 1.0, false));
+            assert_eq!(state.activity, before);
+        }
+        let mut gone = pending;
+        gone.liveness = Liveness::Gone;
+        assert!(!apply_reviewer_result(&mut gone, 1.0, true));
+    }
+
+    #[test]
+    fn permission_requests_distinguish_auto_review_from_human_input() {
+        for (cli, reviewer, expected) in [
+            (Cli::Codex, "auto_review", Activity::Working),
+            (Cli::Codex, "user", Activity::AwaitingInput),
+            (Cli::Codex, "unknown", Activity::AwaitingInput),
+            (Cli::Claude, "auto_review", Activity::AwaitingInput),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("transcript.jsonl");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "type": "turn_context", "payload": {"approvals_reviewer": reviewer}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut event = ev(
+                HookEventKind::PreToolUse,
+                1.0,
+                cli,
+                "a",
+                Some("PermissionRequest"),
+            );
+            event.transcript_path = Some(path.to_string_lossy().into_owned());
+            let mut threads = HashMap::new();
+            let mut owners = HashMap::new();
+            let (tx, rx) = mpsc::channel();
+            let reviewer = reviewer_worker(tx.clone());
+            handle_hook(
+                event,
+                &mut threads,
+                &mut owners,
+                &dir.path().join("owners.json"),
+                0.0,
+                &tx,
+                Some(&reviewer),
+                &DaemonConfig::default(),
+            );
+            if cli == Cli::Codex {
+                let DaemonEvent::ReviewerScanned {
+                    key,
+                    ts,
+                    auto_review,
+                } = rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected reviewer result")
+                };
+                assert!(apply_reviewer_result(
+                    threads.get_mut(&key).unwrap(),
+                    ts,
+                    auto_review
+                ));
+            }
+            assert_eq!(threads[&(cli, "a".into())].activity, expected);
+        }
     }
 
     #[test]

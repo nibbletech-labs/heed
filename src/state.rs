@@ -264,6 +264,10 @@ pub fn apply_event(mut state: ThreadState, ev: &HookEvent) -> ThreadState {
                 Some("AskUserQuestion" | "ExitPlanMode" | "PermissionRequest")
             ) {
                 state.activity = Activity::AwaitingInput;
+            } else if tool.is_some() && !is_meta_tool(tool) {
+                // Execution has resumed; do not wait for a long-running tool
+                // to finish before clearing a stale awaiting-input state.
+                state.activity = Activity::Working;
             }
         }
         HookEventKind::ToolUse => {
@@ -471,6 +475,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_tool_start_clears_stale_waiting_before_completion() {
+        for activity in [Activity::AwaitingInput, Activity::Idle] {
+            let event = ev(
+                HookEventKind::PreToolUse,
+                2.0,
+                Some("Bash"),
+                Some("long build"),
+            );
+            let mut state = initial_state(&event);
+            state.activity = activity;
+            assert_eq!(apply_event(state, &event).activity, Activity::Working);
+        }
+    }
+
+    #[test]
     fn tool_use_after_awaiting_returns_to_working() {
         let events = vec![
             ev(HookEventKind::TurnStart, 1.0, None, None),
@@ -502,7 +521,7 @@ mod tests {
         let state = apply_all(&events);
         assert_eq!(state.last_tool_name.as_deref(), Some("Read"));
         assert_eq!(state.last_tool_target.as_deref(), Some("/foo.rs"));
-        // Real (non-meta) tool in pre_tool_use does NOT flip activity.
+        // A real tool start establishes working activity.
         assert_eq!(state.activity, Activity::Working);
     }
 
