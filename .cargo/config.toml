@@ -1,0 +1,6 @@
+# Darwin builds only. rustc reads MACOSX_DEPLOYMENT_TARGET when compiling and
+# linking Apple targets and writes it as LC_BUILD_VERSION.minos; SMAppService
+# (heed install from Heed.app) needs macOS 13. Non-Apple targets ignore it, so
+# Linux build flags are unchanged.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"

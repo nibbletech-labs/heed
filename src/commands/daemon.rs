@@ -3,11 +3,24 @@
 use std::path::PathBuf;
 
 use crate::daemon::{run, DaemonPaths};
+use crate::service;
 
 pub fn run_foreground() -> Result<(), String> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| "HOME env var not set".to_string())?;
+
+    // Spawned by launchd? The bundle's agent plist has no StandardOutPath,
+    // so point our own stdio at ~/.heed/heedd.{out,err}.log.
+    if let Some(label) = std::env::var_os("XPC_SERVICE_NAME")
+        .filter(|v| service::launchd_log::under_launchd(Some(v.as_os_str())))
+    {
+        let label = label.to_string_lossy().into_owned();
+        if let Err(e) = service::launchd_log::redirect_stdio_to_logs(&home, &label) {
+            eprintln!("heed daemon: could not redirect logs: {e}");
+        }
+    }
+
     let paths = DaemonPaths {
         event_log: crate::install::event_log_path(&home),
         state_file: crate::install::state_path(&home),

@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod daemon_spawn;
 pub mod install;
 pub mod liveness;
+pub mod service;
 pub mod state;
 pub mod succession;
 pub mod tool_display;

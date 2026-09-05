@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod events;
 pub mod install;
 pub mod owner;
+pub mod service;
 pub mod status;
 pub mod uninstall;
 pub mod version;

@@ -26,7 +26,7 @@ toml_edit = "0.22"
 notify = "6"
 crossterm = "0.27"
 ratatui = "0.26"
-nix = { version = "0.28", features = ["signal", "process"] }
+nix = { version = "0.28", features = ["signal", "process", "user", "fs"] }
 chrono = "0.4"
 walkdir = "2"
 log = "0.4"
@@ -34,6 +34,10 @@ env_logger = "0.11"
 thiserror = "1"
 anyhow = "1"
 ctrlc = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSError"] }
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "SMErrors", "objc2", "objc2-foundation"] }
 
 [dev-dependencies]
 tempfile = "3"

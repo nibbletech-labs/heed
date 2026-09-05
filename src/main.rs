@@ -1,5 +1,6 @@
 //! `heed` CLI entry point.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -21,7 +22,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Install Heed hooks for detected CLIs (idempotent). Also spawns the
-    /// daemon if it isn't already running.
+    /// daemon if it isn't already running. Inside Heed.app on macOS 13+ it
+    /// registers the daemon as a login item instead.
     Install {
         /// Skip installing Claude hooks.
         #[arg(long = "skip-claude")]
@@ -94,8 +96,22 @@ enum Cmd {
         action: OwnerCmd,
     },
 
+    /// Inspect or remove the macOS login-item registration (Heed.app only).
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+
     /// Print heed + bundled hook script versions.
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCmd {
+    /// Print the SMAppService status and whether a legacy launchd plist remains.
+    Status,
+    /// Unregister the login item. Hooks and ~/.heed are left untouched.
+    Unregister,
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +152,17 @@ impl From<CliArg> for ThreadCli {
 }
 
 fn main() -> ExitCode {
+    // Started through a symlink into Heed.app (e.g. ~/.heed/bin/heed)?
+    // Re-exec the real binary so SMAppService sees the bundle as Bundle.main.
+    heed::service::reexec_if_symlinked_into_bundle();
+
+    // A double-clicked Heed.app arrives here with no arguments and no TTY.
+    // Exit quietly instead of printing usage.
+    if heed::service::quiet_exit_wanted(std::env::args_os().len(), std::io::stdout().is_terminal())
+    {
+        return ExitCode::SUCCESS;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
@@ -192,6 +219,10 @@ fn main() -> ExitCode {
                 native_thread_id,
             }),
         },
+        Cmd::Service { action } => commands::service::run(match action {
+            ServiceCmd::Status => commands::service::Action::Status,
+            ServiceCmd::Unregister => commands::service::Action::Unregister,
+        }),
         Cmd::Version => commands::version::run(),
     };
 
