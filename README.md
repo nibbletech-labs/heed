@@ -22,6 +22,8 @@ heed install
 
 Prebuilt binaries appear on [GitHub Releases](https://github.com/nibbletech-labs/heed/releases) once a tag is pushed. A Homebrew tap is planned.
 
+macOS releases also ship `Heed-<version>-<arch>-apple-darwin.app.zip`: a signed and notarized `Heed.app` (built by `scripts/package-macos-app.sh`) that installs the daemon as a login item — unzip it to `~/Library/Application Support/Heed/` and run `Heed.app/Contents/MacOS/heed install`.
+
 `heed install` writes hook entries into `~/.claude/settings.json` and `~/.codex/config.toml`, drops some shell scripts under `~/.heed/`, and starts a small daemon in the background. Re-running it is safe. To remove everything, `heed install --uninstall`.
 
 On macOS, `heed install --service-install` writes a launchd plist so the daemon comes back at login. When `heed` runs from inside `Heed.app` (macOS 13+), `heed install` instead registers the daemon with macOS as a login item — it shows up as “Heed” under System Settings › Login Items — and `~/.heed/bin/heed` becomes a symlink to the bundle's binary. `heed service status` shows that registration; `heed service unregister` removes it (hooks and `~/.heed` are left alone).

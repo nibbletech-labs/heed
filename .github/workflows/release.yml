@@ -45,6 +45,12 @@ jobs:
           echo "[target.aarch64-unknown-linux-gnu]" >> .cargo/config.toml
           echo "linker = \"aarch64-linux-gnu-gcc\"" >> .cargo/config.toml
 
+      - name: Set macOS deployment target (darwin only)
+        if: endsWith(matrix.target, '-apple-darwin')
+        # Belt and braces with .cargo/config.toml: SMAppService needs macOS 13,
+        # and the shipped binary must carry minos 13.0.
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -66,6 +72,68 @@ jobs:
             heed-*.tar.gz
             heed-*.tar.gz.sha256
 
+      # --- Heed.app (darwin only) ------------------------------------------
+      # A Heed.app that is not Developer-ID signed, notarized and stapled is
+      # never published: every step below fails the job, naming the missing
+      # secret, rather than falling back to an unsigned bundle.
+
+      - name: Check Apple signing secrets (darwin only)
+        if: endsWith(matrix.target, '-apple-darwin')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Cannot sign Heed.app: repository secret(s) not set: ${missing[*]}"
+            exit 1
+          fi
+          echo "All Apple signing secrets present"
+
+      - name: Import Apple certificate (darwin only)
+        if: endsWith(matrix.target, '-apple-darwin')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 16)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Package, sign and notarize Heed.app (darwin only)
+        if: endsWith(matrix.target, '-apple-darwin')
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          scripts/package-macos-app.sh "target/${{ matrix.target }}/release/heed" "$VERSION" "${{ matrix.target }}" app-out
+
+      - name: Upload Heed.app artifact (darwin only)
+        if: endsWith(matrix.target, '-apple-darwin')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Heed-app-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            app-out/Heed-*.app.zip
+            app-out/Heed-*.app.zip.sha256
+
   release:
     name: Publish GitHub Release
     needs: build
@@ -81,5 +149,7 @@ jobs:
           files: |
             artifacts/heed-*.tar.gz
             artifacts/heed-*.tar.gz.sha256
+            artifacts/Heed-*.app.zip
+            artifacts/Heed-*.app.zip.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
