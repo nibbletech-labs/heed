@@ -123,7 +123,10 @@ log "codesign --verify --deep --strict --verbose=2"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # The agent plist must be inside the seal or SMAppService will not load it.
-if ! codesign -d --verbose=4 "$APP" 2>&1 | grep -q 'Sealed Resources'; then
+# Capture first: `codesign | grep -q` races under pipefail (grep exits on the
+# match, codesign gets SIGPIPE, the pipeline reports failure ~1 run in 3).
+SIG_INFO="$(codesign -d --verbose=4 "$APP" 2>&1)"
+if ! printf '%s\n' "$SIG_INFO" | grep -q 'Sealed Resources'; then
     die "bundle signature has no sealed resources"
 fi
 if ! grep -q 'Library/LaunchAgents/dev.heed.agent.plist' "$APP/Contents/_CodeSignature/CodeResources"; then
