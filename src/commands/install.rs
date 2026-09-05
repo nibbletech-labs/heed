@@ -4,15 +4,16 @@
 //! detached child unless `--no-spawn` or `--service-install` was given.
 //!
 //! Inside `Heed.app` on macOS 13+ neither flag matters: the daemon is
-//! registered with ServiceManagement as a login item (`dev.heed.agent`),
-//! after any legacy `dev.heed.daemon` plist has been booted out and removed.
+//! registered with ServiceManagement as a login item (`dev.heed.agent`);
+//! any legacy `dev.heed.daemon` agent is booted out first and its plist
+//! removed once registration has succeeded.
 
 use std::path::{Path, PathBuf};
 
 use crate::daemon_spawn;
 use crate::install::service::{render_linux_systemd, render_macos_plist, ServiceUnit};
 use crate::install::{self, InstallOptions, InstallReport};
-use crate::service::{self, BundleLayout, ServiceStatus, AGENT_LABEL};
+use crate::service::{self, BundleLayout, RegisterAction, ServiceStatus, AGENT_LABEL};
 
 #[derive(Clone, Debug)]
 pub struct InstallArgs {
@@ -55,53 +56,93 @@ pub fn run(args: InstallArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Bundle path. HD-1 order: bootout legacy → delete legacy plist → symlink →
-/// register — but only after ServiceManagement has confirmed it can see this
-/// bundle, so an unsealed bundle never dismantles a working legacy agent.
+/// Bundle path (criterion 1). Decided from `SMAppService.status` alone —
+/// there is no "unsealed bundle" pre-check, because `notFound` is exactly
+/// what a fresh, valid bundle reports before its first `register()`.
+///
+/// Register path: boot out the legacy agent (plist file kept) → stop any
+/// pidfile daemon → `register()`. On success delete the legacy plist and
+/// ensure the `~/.heed/bin/heed` symlink; on failure bootstrap the untouched
+/// legacy plist again and return the NSError text, so a bundle that
+/// ServiceManagement rejects never dismantles a working legacy agent.
+///
+/// Already-registered path (`enabled` / `requiresApproval`): skip
+/// `register()`, run the full legacy cleanup and the symlink as before.
+///
+/// The legacy label is only ever booted out / bootstrapped through
+/// `launchctl`; it never reaches `SMAppService` (HD-2).
 fn register_bundle_agent(home: &Path, bundle: &BundleLayout) -> Result<(), String> {
     let agent = service::heed_agent();
     let before = agent.status();
 
-    if before == ServiceStatus::NotFound {
-        return Err(format!(
-            "Heed.app at {} is not sealed/visible to ServiceManagement (status notFound); \
-             legacy agent left untouched. Is the bundle Developer-ID signed?",
-            bundle.root.display()
-        ));
-    }
+    match service::register_action(before) {
+        RegisterAction::AlreadyRegistered => {
+            for note in service::legacy::run_legacy_cleanup(home)? {
+                println!("  {note}");
+            }
+            ensure_symlink(home, bundle)?;
+            println!("\n{AGENT_LABEL} already registered ({}).", before.as_str());
+            if before == ServiceStatus::RequiresApproval {
+                print_approval_hint();
+            }
+            Ok(())
+        }
+        RegisterAction::Register => {
+            // The bundle plist is RunAtLoad: registering starts the new
+            // daemon at once, so nothing else may own the state files then.
+            let plan = service::legacy::plan_legacy_cleanup(home);
+            let bootout_notes = service::legacy::bootout_legacy(&plan);
+            for note in &bootout_notes {
+                println!("  {note}");
+            }
+            if !bootout_notes.is_empty() {
+                // `launchctl bootout` returns before the job's process is
+                // fully gone; let the pidfile daemon disappear on its own so
+                // the SIGTERM below is not aimed at a pid that just exited.
+                wait_for_daemon_exit(home);
+            }
+            if let Err(e) = daemon_spawn::stop_if_running(home) {
+                eprintln!("Warning: could not stop daemon: {e}");
+            }
 
-    for note in service::legacy::run_legacy_cleanup(home)? {
-        println!("  {note}");
+            let outcome = service::legacy::decide_after_register(&plan, agent.register());
+            let notes = service::legacy::finish_migration(outcome)
+                .map_err(|e| format!("could not register {AGENT_LABEL}: {e}"))?;
+            for note in notes {
+                println!("  {note}");
+            }
+            ensure_symlink(home, bundle)?;
+
+            let after = agent.status();
+            println!(
+                "\nRegistered {AGENT_LABEL} via SMAppService: {}",
+                after.as_str()
+            );
+            if after == ServiceStatus::RequiresApproval {
+                print_approval_hint();
+            }
+            Ok(())
+        }
     }
+}
+
+/// Poll the pidfile for up to 3 s until no live daemon is recorded there.
+fn wait_for_daemon_exit(home: &Path) {
+    for _ in 0..30 {
+        if daemon_spawn::running_pid(home).is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn ensure_symlink(home: &Path, bundle: &BundleLayout) -> Result<(), String> {
     service::ensure_cli_symlink(home, &bundle.executable)?;
     println!(
         "  {} -> {}",
         service::cli_symlink_path(home).display(),
         bundle.executable.display()
     );
-
-    if before.is_registered() {
-        println!("\n{AGENT_LABEL} already registered ({}).", before.as_str());
-        if before == ServiceStatus::RequiresApproval {
-            print_approval_hint();
-        }
-        return Ok(());
-    }
-
-    // NotRegistered: stop a foreground-spawned daemon (pidfile) so the
-    // launchd-managed one owns the state files, then register.
-    if let Err(e) = daemon_spawn::stop_if_running(home) {
-        eprintln!("Warning: could not stop daemon: {e}");
-    }
-    agent.register()?;
-    let after = agent.status();
-    println!(
-        "\nRegistered {AGENT_LABEL} via SMAppService: {}",
-        after.as_str()
-    );
-    if after == ServiceStatus::RequiresApproval {
-        print_approval_hint();
-    }
     Ok(())
 }
 

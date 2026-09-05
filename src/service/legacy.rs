@@ -47,17 +47,85 @@ pub fn plan_legacy_cleanup(home: &Path) -> LegacyPlan {
 /// bootout is skipped.
 pub fn run_legacy_cleanup(home: &Path) -> Result<Vec<String>, String> {
     let plan = plan_legacy_cleanup(home);
+    let mut notes = bootout_legacy(&plan);
+    if let Some(plist) = plan.delete_plist {
+        notes.push(delete_legacy_plist(&plist)?);
+    }
+    Ok(notes)
+}
+
+/// Phase 1 of the migration around `register()`: boot the legacy agent out
+/// (so two daemons never overlap on `state.json` / `heedd.pid`) but leave its
+/// plist file in place. If `register()` then fails, that untouched file is
+/// bootstrapped again and the machine is exactly as it was. Best-effort;
+/// notes for the report.
+pub fn bootout_legacy(plan: &LegacyPlan) -> Vec<String> {
     let mut notes = Vec::new();
     if plan.bootout {
         if let Some(target) = bootout_legacy_agent() {
             notes.push(format!("booted out {target}"));
         }
     }
-    if let Some(plist) = plan.delete_plist {
-        std::fs::remove_file(&plist).map_err(|e| format!("remove {}: {e}", plist.display()))?;
-        notes.push(format!("removed {}", plist.display()));
+    notes
+}
+
+/// Phase 2, decided from the `register()` result. Pure: nothing on disk moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// `register()` succeeded: the legacy plist (if any) can go.
+    Commit { delete_plist: Option<PathBuf> },
+    /// `register()` failed: bootstrap the legacy plist (if any) again and
+    /// report the error. The plist is never deleted on this path.
+    Rollback {
+        bootstrap: Option<PathBuf>,
+        error: String,
+    },
+}
+
+/// Pure decision for [`finish_migration`].
+pub fn decide_after_register(plan: &LegacyPlan, register: Result<(), String>) -> MigrationOutcome {
+    match register {
+        Ok(()) => MigrationOutcome::Commit {
+            delete_plist: plan.delete_plist.clone(),
+        },
+        Err(error) => MigrationOutcome::Rollback {
+            bootstrap: plan.delete_plist.clone(),
+            error,
+        },
     }
-    Ok(notes)
+}
+
+/// Apply a [`MigrationOutcome`]: delete the plist on `Commit`; on `Rollback`
+/// re-bootstrap the legacy plist (best-effort) and hand back the `register()`
+/// error text verbatim so the caller exits 1 with the machine as it was.
+pub fn finish_migration(outcome: MigrationOutcome) -> Result<Vec<String>, String> {
+    match outcome {
+        MigrationOutcome::Commit { delete_plist } => Ok(delete_plist
+            .map(|p| delete_legacy_plist(&p))
+            .transpose()?
+            .into_iter()
+            .collect()),
+        MigrationOutcome::Rollback { bootstrap, error } => {
+            if let Some(plist) = bootstrap {
+                match bootstrap_legacy_agent(&plist) {
+                    Some(true) => eprintln!("Restored legacy agent from {}", plist.display()),
+                    Some(false) => eprintln!(
+                        "Warning: launchctl bootstrap {} failed; run it by hand: \
+                         launchctl bootstrap gui/$(id -u) {}",
+                        plist.display(),
+                        plist.display()
+                    ),
+                    None => {}
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn delete_legacy_plist(plist: &Path) -> Result<String, String> {
+    std::fs::remove_file(plist).map_err(|e| format!("remove {}: {e}", plist.display()))?;
+    Ok(format!("removed {}", plist.display()))
 }
 
 /// `launchctl bootout gui/<uid>/dev.heed.daemon`. Returns the service target
@@ -70,19 +138,41 @@ fn bootout_legacy_agent() -> Option<String> {
         nix::unistd::getuid(),
         crate::service::LEGACY_LABEL
     );
-    std::process::Command::new("launchctl")
-        .args(["bootout", &target])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .map(|_| target)
+    launchctl(&["bootout", &target]).map(|_| target)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn bootout_legacy_agent() -> Option<String> {
     None
+}
+
+/// `launchctl bootstrap gui/<uid> <plist>` — the inverse of
+/// [`bootout_legacy_agent`], used only to undo a bootout after a failed
+/// `register()`. `Some(exit status success)`, or `None` when launchctl could
+/// not be run at all.
+#[cfg(target_os = "macos")]
+fn bootstrap_legacy_agent(plist: &Path) -> Option<bool> {
+    let domain = format!("gui/{}", nix::unistd::getuid());
+    launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bootstrap_legacy_agent(_plist: &Path) -> Option<bool> {
+    None
+}
+
+/// Run `launchctl` with stdio discarded; `Some(success)` or `None` if it
+/// could not be spawned.
+#[cfg(target_os = "macos")]
+fn launchctl(args: &[&str]) -> Option<bool> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| s.success())
 }
 
 #[cfg(test)]
@@ -97,6 +187,65 @@ mod tests {
             LegacyPlan {
                 bootout: false,
                 delete_plist: None
+            }
+        );
+    }
+
+    fn home_with_legacy_plist() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let plist = legacy_plist_path(tmp.path());
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"<plist/>").unwrap();
+        (tmp, plist)
+    }
+
+    /// Criterion 1, failure path: register() Err ⇒ the legacy plist (still
+    /// on disk, only booted out) is bootstrapped again and the NSError text
+    /// is returned; the plist is never deleted.
+    #[test]
+    fn after_register_failure_rolls_back_legacy_and_keeps_plist() {
+        let (tmp, plist) = home_with_legacy_plist();
+        let plan = plan_legacy_cleanup(tmp.path());
+        let err = "Operation not permitted (SMAppServiceErrorDomain code 1)".to_string();
+        let outcome = decide_after_register(&plan, Err(err.clone()));
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Rollback {
+                bootstrap: Some(plist.clone()),
+                error: err,
+            }
+        );
+        assert!(plist.exists(), "decision must not touch the filesystem");
+    }
+
+    /// Criterion 1, success path: register() Ok ⇒ delete the legacy plist.
+    #[test]
+    fn after_register_success_commits_plist_deletion() {
+        let (tmp, plist) = home_with_legacy_plist();
+        let plan = plan_legacy_cleanup(tmp.path());
+        assert_eq!(
+            decide_after_register(&plan, Ok(())),
+            MigrationOutcome::Commit {
+                delete_plist: Some(plist),
+            }
+        );
+    }
+
+    /// Fresh Mac (no legacy plist): nothing to restore, nothing to delete;
+    /// the register() error still propagates.
+    #[test]
+    fn after_register_without_legacy_plist_has_nothing_to_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = plan_legacy_cleanup(tmp.path());
+        assert_eq!(
+            decide_after_register(&plan, Ok(())),
+            MigrationOutcome::Commit { delete_plist: None }
+        );
+        assert_eq!(
+            decide_after_register(&plan, Err("boom".into())),
+            MigrationOutcome::Rollback {
+                bootstrap: None,
+                error: "boom".into(),
             }
         );
     }

@@ -51,6 +51,28 @@ impl ServiceStatus {
     }
 }
 
+/// What `heed install` does with the agent, decided from `SMAppService.status`
+/// alone. There is deliberately no "unsealed bundle" pre-check: `notFound`
+/// is what a fresh, valid, Developer-ID-signed bundle reports before its
+/// first ever `register()` (HD-2), and ServiceManagement cannot tell
+/// "never seen" from "unsealed" — only `register()` can, so it is the probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterAction {
+    /// `notFound` / `notRegistered`: call `register()`.
+    Register,
+    /// `enabled` / `requiresApproval`: BTM already has our record.
+    AlreadyRegistered,
+}
+
+/// Pure status → action mapping for [`RegisterAction`].
+pub fn register_action(status: ServiceStatus) -> RegisterAction {
+    if status.is_registered() {
+        RegisterAction::AlreadyRegistered
+    } else {
+        RegisterAction::Register
+    }
+}
+
 /// Criterion 6: a double-clicked bundle is launched with no arguments and no
 /// controlling terminal. Exit quietly instead of printing clap help.
 pub fn quiet_exit_wanted(argc: usize, stdout_is_terminal: bool) -> bool {
@@ -221,6 +243,29 @@ mod tests {
         assert!(ServiceStatus::RequiresApproval.is_registered());
         assert!(!ServiceStatus::NotRegistered.is_registered());
         assert!(!ServiceStatus::NotFound.is_registered());
+    }
+
+    /// Criterion 1: there is no status()-based pre-check. `notFound` is what
+    /// a fresh, valid bundle reports before its first ever register() (HD-2),
+    /// so it must lead to register(), exactly like `notRegistered`.
+    #[test]
+    fn register_action_registers_on_not_found_and_not_registered() {
+        assert_eq!(
+            register_action(ServiceStatus::NotFound),
+            RegisterAction::Register
+        );
+        assert_eq!(
+            register_action(ServiceStatus::NotRegistered),
+            RegisterAction::Register
+        );
+        assert_eq!(
+            register_action(ServiceStatus::Enabled),
+            RegisterAction::AlreadyRegistered
+        );
+        assert_eq!(
+            register_action(ServiceStatus::RequiresApproval),
+            RegisterAction::AlreadyRegistered
+        );
     }
 
     #[test]

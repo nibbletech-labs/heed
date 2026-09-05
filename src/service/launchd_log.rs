@@ -6,10 +6,17 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// launchd sets `XPC_SERVICE_NAME` for the jobs it spawns (`dev.heed.agent`
-/// from the bundle, `dev.heed.daemon` from the legacy plist).
+/// launchd sets `XPC_SERVICE_NAME` to the job label for the jobs it spawns
+/// (`dev.heed.agent` from the bundle, `dev.heed.daemon` from the legacy
+/// plist). Only an exact match counts: LaunchServices sets the same variable
+/// to `application.<bundle-id>.N.N` on every GUI-descended process and login
+/// shells carry `0`, so a `heed daemon` run by hand in a terminal must keep
+/// its own stdio.
 pub fn under_launchd(xpc_service_name: Option<&OsStr>) -> bool {
-    xpc_service_name.is_some_and(|v| !v.is_empty())
+    xpc_service_name.is_some_and(|v| {
+        v == OsStr::new(crate::service::AGENT_LABEL)
+            || v == OsStr::new(crate::service::LEGACY_LABEL)
+    })
 }
 
 /// `(~/.heed/heedd.out.log, ~/.heed/heedd.err.log)` — the same files the
@@ -58,6 +65,14 @@ mod tests {
     fn under_launchd_detects_xpc_service_name() {
         assert!(under_launchd(Some(OsStr::new("dev.heed.agent"))));
         assert!(under_launchd(Some(OsStr::new("dev.heed.daemon"))));
+        // Login shells carry XPC_SERVICE_NAME=0; every GUI-descended process
+        // (a Codezilla or Terminal.app shell) carries application.<bundle>.N.N.
+        // Neither is launchd running *our* job.
+        assert!(!under_launchd(Some(OsStr::new("0"))));
+        assert!(!under_launchd(Some(OsStr::new(
+            "application.com.nibbletech.codezilla.123.456"
+        ))));
+        assert!(!under_launchd(Some(OsStr::new("dev.heed.agent.plist"))));
         assert!(!under_launchd(Some(OsStr::new(""))));
         assert!(!under_launchd(None));
     }
