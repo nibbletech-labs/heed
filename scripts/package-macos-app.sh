@@ -3,6 +3,16 @@
 #
 #   scripts/package-macos-app.sh <heed-binary> <version> <target-triple> <out-dir>
 #
+# <version> is MAJOR.MINOR.PATCH with an optional -prerelease suffix; a
+# leading "v" (as in a git tag) is accepted and stripped. The full string
+# becomes CFBundleShortVersionString and the zip name; CFBundleVersion is
+# the numeric MAJOR.MINOR.PATCH only, as Apple requires.
+#
+# <heed-binary> must have been linked with MACOSX_DEPLOYMENT_TARGET=13.0
+# (LC_BUILD_VERSION minos >= 13.0) — a `cargo build` inside this checkout
+# does that via .cargo/config.toml; a `cargo install --git` build does not
+# and is refused here, because SMAppService needs macOS 13.
+#
 # Writes:
 #   <out-dir>/Heed.app
 #   <out-dir>/Heed-<version>-<triple>.app.zip
@@ -41,12 +51,23 @@ OUT_DIR="$4"
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'package-macos-app: error: %s\n' "$*" >&2; exit 1; }
 
+# Minimum LC_BUILD_VERSION minos the bundled binary must carry (SMAppService).
+MIN_MINOS_MAJOR=13
+MIN_MINOS_MINOR=0
+
 # --- preconditions ---------------------------------------------------------
 
 [ -f "$BINARY" ] || die "heed binary not found: $BINARY"
 [ -x "$BINARY" ] || die "heed binary is not executable: $BINARY"
 [ -n "$VERSION" ] || die "version must not be empty"
 [ -n "$TRIPLE" ] || die "target triple must not be empty"
+
+# Version shape: MAJOR.MINOR.PATCH[-prerelease], optional leading "v".
+VERSION="${VERSION#v}"
+if ! [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid version '$2': expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-prerelease (a leading 'v' is allowed), e.g. 0.3.1 or v0.3.1-rc.1"
+fi
+BUNDLE_VERSION="${BASH_REMATCH[1]}"
 
 if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
     die "APPLE_SIGNING_IDENTITY is not set. Refusing to build an unsigned Heed.app — SMAppService rejects unsealed bundles. Set APPLE_SIGNING_IDENTITY to a 'Developer ID Application: …' identity present in the keychain."
@@ -67,7 +88,7 @@ else
     fi
 fi
 
-for tool in codesign ditto plutil shasum xattr; do
+for tool in codesign ditto otool plutil shasum xattr; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 if [ "$NOTARIZE" = 1 ]; then
@@ -93,8 +114,9 @@ log "Assembling $APP (version $VERSION, $TRIPLE)"
 rm -rf "$APP" "$ZIP" "$ZIP.sha256"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents"
 
-sed "s/__VERSION__/${VERSION}/g" "$RES_DIR/Info.plist" > "$APP/Contents/Info.plist"
-grep -q '__VERSION__' "$APP/Contents/Info.plist" && die "version template not fully substituted"
+sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUNDLE_VERSION__/${BUNDLE_VERSION}/g" \
+    "$RES_DIR/Info.plist" > "$APP/Contents/Info.plist"
+grep -q '__' "$APP/Contents/Info.plist" && die "version template not fully substituted"
 cp "$RES_DIR/dev.heed.agent.plist" "$APP/Contents/Library/LaunchAgents/dev.heed.agent.plist"
 cp "$RES_DIR/Heed.icns" "$APP/Contents/Resources/Heed.icns"
 cp "$BINARY" "$APP/Contents/MacOS/heed"
@@ -104,10 +126,38 @@ plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/dev.
 # Finder metadata / resource forks on any file make codesign refuse the bundle.
 xattr -cr "$APP"
 
-if command -v otool >/dev/null 2>&1; then
-    log "Deployment target of bundled binary:"
-    otool -l "$APP/Contents/MacOS/heed" | grep -A4 LC_BUILD_VERSION | grep -E 'platform|minos|sdk' || true
+# Refuse a binary whose deployment target is below macOS 13: SMAppService is
+# unavailable there, and a `cargo install --git` build (outside this
+# checkout, so without .cargo/config.toml's MACOSX_DEPLOYMENT_TARGET) would
+# silently carry the SDK default.
+LOAD_CMDS="$(otool -l "$APP/Contents/MacOS/heed")"
+log "Deployment target of bundled binary:"
+printf '%s\n' "$LOAD_CMDS" | grep -A4 LC_BUILD_VERSION | grep -E 'platform|minos|sdk' || true
+MINOS="$(printf '%s\n' "$LOAD_CMDS" | awk '
+    /LC_BUILD_VERSION/ { in_build = 1; next }
+    in_build && $1 == "minos" { print $2; exit }
+    /^Load command/ { in_build = 0 }
+')"
+if [ -z "$MINOS" ]; then
+    # Older toolchains write LC_VERSION_MIN_MACOSX instead.
+    MINOS="$(printf '%s\n' "$LOAD_CMDS" | awk '
+        /LC_VERSION_MIN_MACOSX/ { in_min = 1; next }
+        in_min && $1 == "version" { print $2; exit }
+        /^Load command/ { in_min = 0 }
+    ')"
 fi
+[ -n "$MINOS" ] || die "could not read the deployment target (LC_BUILD_VERSION minos) of $BINARY"
+MINOS_MAJOR="${MINOS%%.*}"
+MINOS_REST="${MINOS#*.}"
+MINOS_MINOR="${MINOS_REST%%.*}"
+[ "$MINOS_REST" = "$MINOS" ] && MINOS_MINOR=0
+if ! [[ "$MINOS_MAJOR" =~ ^[0-9]+$ && "$MINOS_MINOR" =~ ^[0-9]+$ ]]; then
+    die "unparseable deployment target '$MINOS' in $BINARY"
+fi
+if [ "$MINOS_MAJOR" -lt "$MIN_MINOS_MAJOR" ] || { [ "$MINOS_MAJOR" -eq "$MIN_MINOS_MAJOR" ] && [ "$MINOS_MINOR" -lt "$MIN_MINOS_MINOR" ]; }; then
+    die "$BINARY was linked for macOS $MINOS; Heed.app needs a deployment target of at least $MIN_MINOS_MAJOR.$MIN_MINOS_MINOR (SMAppService). Build it inside this checkout (cargo build --release picks up MACOSX_DEPLOYMENT_TARGET=13.0 from .cargo/config.toml), not with cargo install."
+fi
+log "Deployment target $MINOS >= $MIN_MINOS_MAJOR.$MIN_MINOS_MINOR: ok"
 
 # --- sign ------------------------------------------------------------------
 

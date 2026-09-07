@@ -24,6 +24,8 @@ Prebuilt binaries appear on [GitHub Releases](https://github.com/nibbletech-labs
 
 macOS releases also ship `Heed-<version>-<arch>-apple-darwin.app.zip`: a signed and notarized `Heed.app` (built by `scripts/package-macos-app.sh`) that installs the daemon as a login item — unzip it to `~/Library/Application Support/Heed/` and run `Heed.app/Contents/MacOS/heed install`.
 
+A `cargo install` build is not the bundle path: it gives you the bare `heed` binary, which uses the launchd plist route above. `Heed.app` is only produced by `scripts/package-macos-app.sh` from a binary built inside this checkout (`cargo build --release`), where `.cargo/config.toml` sets the macOS 13 deployment target the login-item registration needs; the script refuses a binary built without it.
+
 `heed install` writes hook entries into `~/.claude/settings.json` and `~/.codex/config.toml`, drops some shell scripts under `~/.heed/`, and starts a small daemon in the background. Re-running it is safe. To remove everything, `heed install --uninstall`.
 
 On macOS, `heed install --service-install` writes a launchd plist so the daemon comes back at login. When `heed` runs from inside `Heed.app` (macOS 13+), `heed install` instead registers the daemon with macOS as a login item — it shows up as “Heed” under System Settings › Login Items — and `~/.heed/bin/heed` becomes a symlink to the bundle's binary. `heed service status` shows that registration; `heed service unregister` removes it (hooks and `~/.heed` are left alone).
