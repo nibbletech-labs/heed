@@ -123,21 +123,24 @@ pub fn macos_major_version(product_version: &str) -> Option<u32> {
         .and_then(|major| major.parse().ok())
 }
 
-/// Runtime check via `sw_vers -productVersion`. On any failure to run or
-/// parse it, assume supported: the binary's `minos 13.0` already refuses to
-/// load below 13. Always `false` off macOS.
+/// Runtime check via `sw_vers -productVersion`, run once per process and
+/// cached. On any failure to run or parse it, assume supported: the binary's
+/// `minos 13.0` already refuses to load below 13. Always `false` off macOS.
 #[cfg(target_os = "macos")]
 pub fn macos_supports_smappservice() -> bool {
-    let Ok(out) = std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-    else {
-        return true;
-    };
-    match macos_major_version(&String::from_utf8_lossy(&out.stdout)) {
-        Some(major) => major >= MIN_MACOS_MAJOR,
-        None => true,
-    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Ok(out) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        else {
+            return true;
+        };
+        match macos_major_version(&String::from_utf8_lossy(&out.stdout)) {
+            Some(major) => major >= MIN_MACOS_MAJOR,
+            None => true,
+        }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -161,9 +164,20 @@ pub fn cli_symlink_path(home: &Path) -> PathBuf {
     home.join(".heed/bin/heed")
 }
 
+/// Scratch name beside [`cli_symlink_path`] used to swap the link in
+/// atomically. Per-pid so two concurrent installs never share it.
+pub fn cli_symlink_temp_path(home: &Path) -> PathBuf {
+    home.join(format!(".heed/bin/.heed.{}.tmp", std::process::id()))
+}
+
 /// `~/.heed/bin/heed -> target`. Creates `~/.heed/bin`, replaces any existing
 /// file or symlink at the link path, idempotent. Fails if the link path is a
 /// directory.
+///
+/// The replacement is atomic: the new link is created under a temp name in
+/// the same directory and `rename(2)`d over the old entry, so there is no
+/// window in which `~/.heed/bin/heed` does not exist (Codezilla resolves it
+/// at any moment).
 pub fn ensure_cli_symlink(home: &Path, target: &Path) -> Result<(), String> {
     let link = cli_symlink_path(home);
     let dir = link.parent().expect("symlink path has a parent");
@@ -179,13 +193,25 @@ pub fn ensure_cli_symlink(home: &Path, target: &Path) -> Result<(), String> {
             if meta.is_symlink() && std::fs::read_link(&link).ok().as_deref() == Some(target) {
                 return Ok(());
             }
-            std::fs::remove_file(&link).map_err(|e| format!("remove {}: {e}", link.display()))?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("stat {}: {e}", link.display())),
     }
-    std::os::unix::fs::symlink(target, &link)
-        .map_err(|e| format!("symlink {} -> {}: {e}", link.display(), target.display()))
+
+    let temp = cli_symlink_temp_path(home);
+    // A stale entry from an interrupted earlier run would make symlink()
+    // fail with EEXIST; it is ours to clear.
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove {}: {e}", temp.display())),
+    }
+    std::os::unix::fs::symlink(target, &temp)
+        .map_err(|e| format!("symlink {} -> {}: {e}", temp.display(), target.display()))?;
+    std::fs::rename(&temp, &link).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("rename {} -> {}: {e}", temp.display(), link.display())
+    })
 }
 
 #[cfg(test)]
@@ -231,6 +257,48 @@ mod tests {
         let target_b = home.join("B.app/Contents/MacOS/heed");
         ensure_cli_symlink(home, &target_b).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target_b);
+
+        // The swap goes through a temp name beside the link; nothing but the
+        // link itself may be left in ~/.heed/bin afterwards.
+        assert_eq!(bin_dir_entries(home), vec!["heed".to_string()]);
+    }
+
+    fn bin_dir_entries(home: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(cli_symlink_path(home).parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// HD-11 (2): the symlink is swapped in atomically (create at a temp
+    /// name, rename over the link) so there is never a moment without
+    /// `~/.heed/bin/heed`. A stale temp entry from an interrupted earlier
+    /// run must neither break the swap nor be left behind.
+    #[test]
+    fn ensure_cli_symlink_swaps_atomically_and_cleans_stale_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let link = cli_symlink_path(home);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let stale = cli_symlink_temp_path(home);
+        assert_ne!(stale, link);
+        assert_eq!(stale.parent(), link.parent());
+        std::os::unix::fs::symlink("/nonexistent/old", &stale).unwrap();
+
+        let target = home.join("A.app/Contents/MacOS/heed");
+        ensure_cli_symlink(home, &target).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(bin_dir_entries(home), vec!["heed".to_string()]);
+
+        // Replacing an existing link never removes it first: a stale temp
+        // entry is cleared, the new link is created there, then renamed.
+        let target_b = home.join("B.app/Contents/MacOS/heed");
+        std::fs::write(&stale, b"stale").unwrap();
+        ensure_cli_symlink(home, &target_b).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), target_b);
+        assert_eq!(bin_dir_entries(home), vec!["heed".to_string()]);
     }
 
     #[test]

@@ -99,15 +99,36 @@ fn register_bundle_agent(home: &Path, bundle: &BundleLayout) -> Result<(), Strin
                 // `launchctl bootout` returns before the job's process is
                 // fully gone; let the pidfile daemon disappear on its own so
                 // the SIGTERM below is not aimed at a pid that just exited.
-                wait_for_daemon_exit(home);
+                daemon_spawn::wait_for_daemon_exit(home);
             }
-            if let Err(e) = daemon_spawn::stop_if_running(home) {
-                eprintln!("Warning: could not stop daemon: {e}");
-            }
+            let stopped_daemon = match daemon_spawn::stop_if_running(home) {
+                Ok(stopped) => stopped,
+                Err(e) => {
+                    eprintln!("Warning: could not stop daemon: {e}");
+                    false
+                }
+            };
 
             let outcome = service::legacy::decide_after_register(&plan, agent.register());
-            let notes = service::legacy::finish_migration(outcome)
-                .map_err(|e| format!("could not register {AGENT_LABEL}: {e}"))?;
+            let respawn = service::legacy::respawn_after_rollback(&outcome, stopped_daemon);
+            let finished = service::legacy::finish_migration(outcome);
+            if respawn {
+                // No legacy plist to bootstrap again, so the rollback would
+                // leave the daemon we just stopped stopped. Put it back the
+                // way a bare-binary install runs it.
+                match daemon_spawn::spawn_if_not_running(home) {
+                    Ok(daemon_spawn::SpawnResult::Spawned(pid)) => {
+                        eprintln!(
+                            "Registration failed; restarted the daemon it stopped (pid {pid})."
+                        )
+                    }
+                    Ok(daemon_spawn::SpawnResult::AlreadyRunning(pid)) => {
+                        eprintln!("Registration failed; daemon already running again (pid {pid}).")
+                    }
+                    Err(e) => eprintln!("Warning: could not restart daemon: {e}"),
+                }
+            }
+            let notes = finished.map_err(|e| format!("could not register {AGENT_LABEL}: {e}"))?;
             for note in notes {
                 println!("  {note}");
             }
@@ -123,16 +144,6 @@ fn register_bundle_agent(home: &Path, bundle: &BundleLayout) -> Result<(), Strin
             }
             Ok(())
         }
-    }
-}
-
-/// Poll the pidfile for up to 3 s until no live daemon is recorded there.
-fn wait_for_daemon_exit(home: &Path) {
-    for _ in 0..30 {
-        if daemon_spawn::running_pid(home).is_none() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

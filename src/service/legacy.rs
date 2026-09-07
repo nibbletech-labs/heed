@@ -95,6 +95,22 @@ pub fn decide_after_register(plan: &LegacyPlan, register: Result<(), String>) ->
     }
 }
 
+/// HD-11 (3): after a failed `register()` with no legacy plist to bootstrap
+/// again, the pidfile daemon that `stop_if_running` stopped just before the
+/// probe would stay stopped. `true` when the caller should respawn it. With
+/// a plist the rollback bootstrap restores the daemon instead; nothing to do
+/// when no daemon had been stopped. Pure.
+pub fn respawn_after_rollback(outcome: &MigrationOutcome, stopped_daemon: bool) -> bool {
+    stopped_daemon
+        && matches!(
+            outcome,
+            MigrationOutcome::Rollback {
+                bootstrap: None,
+                ..
+            }
+        )
+}
+
 /// Apply a [`MigrationOutcome`]: delete the plist on `Commit`; on `Rollback`
 /// re-bootstrap the legacy plist (best-effort) and hand back the `register()`
 /// error text verbatim so the caller exits 1 with the machine as it was.
@@ -248,6 +264,29 @@ mod tests {
                 error: "boom".into(),
             }
         );
+    }
+
+    /// HD-11 (3): when `register()` fails and there is no legacy plist to
+    /// bootstrap again, a pidfile daemon that `stop_if_running` stopped
+    /// would otherwise stay stopped — that path respawns it. With a plist
+    /// the rollback bootstrap restores the daemon, so no respawn; and there
+    /// is nothing to restore if no daemon had been stopped.
+    #[test]
+    fn respawn_only_after_rollback_without_plist_when_a_daemon_was_stopped() {
+        let rollback_no_plist = MigrationOutcome::Rollback {
+            bootstrap: None,
+            error: "boom".into(),
+        };
+        let rollback_with_plist = MigrationOutcome::Rollback {
+            bootstrap: Some(PathBuf::from("/x/dev.heed.daemon.plist")),
+            error: "boom".into(),
+        };
+        let commit = MigrationOutcome::Commit { delete_plist: None };
+
+        assert!(respawn_after_rollback(&rollback_no_plist, true));
+        assert!(!respawn_after_rollback(&rollback_no_plist, false));
+        assert!(!respawn_after_rollback(&rollback_with_plist, true));
+        assert!(!respawn_after_rollback(&commit, true));
     }
 
     #[test]

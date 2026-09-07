@@ -74,8 +74,7 @@ fn daemon_under_launchd_env_appends_to_heed_logs() {
     }
     assert!(state_path.exists(), "daemon never wrote state.json");
 
-    // SIGINT: ctrlc handles it (SIGTERM is not caught without the
-    // `termination` feature).
+    // SIGINT: ctrlc handles it.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(daemon.id() as i32),
         nix::sys::signal::Signal::SIGINT,
@@ -92,6 +91,55 @@ fn daemon_under_launchd_env_appends_to_heed_logs() {
     assert!(
         err_log.contains("daemon: started under launchd (dev.heed.agent)"),
         "startup line missing from heedd.err.log:\n{err_log}"
+    );
+}
+
+/// HD-11 (4): `launchctl bootout` / `SMAppService.unregister` deliver
+/// SIGTERM, not SIGINT. The daemon must take the same graceful shutdown path
+/// (final state flush, "shutdown requested" log line) for both.
+#[test]
+fn daemon_under_launchd_env_shuts_down_gracefully_on_sigterm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let status = heed_cmd(home)
+        .args(["install", "--skip-claude", "--skip-codex", "--no-spawn"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut daemon = heed_cmd(home)
+        .arg("daemon")
+        .env("XPC_SERVICE_NAME", "dev.heed.agent")
+        .env("RUST_LOG", "info")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+
+    let state_path = home.join(".heed/state.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !state_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(state_path.exists(), "daemon never wrote state.json");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let exit = daemon.wait().unwrap();
+    assert!(
+        exit.success(),
+        "daemon must exit 0 on SIGTERM (graceful shutdown), got {exit}"
+    );
+
+    let err_log =
+        std::fs::read_to_string(home.join(".heed/heedd.err.log")).expect("heedd.err.log exists");
+    assert!(
+        err_log.contains("daemon: shutdown requested"),
+        "SIGTERM did not take the graceful shutdown path:\n{err_log}"
     );
 }
 
