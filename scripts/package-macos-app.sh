@@ -102,36 +102,12 @@ for f in Info.plist dev.heed.agent.plist Heed.icns; do
     [ -f "$RES_DIR/$f" ] || die "missing bundle resource: $RES_DIR/$f"
 done
 
-# --- assemble --------------------------------------------------------------
-
-mkdir -p "$OUT_DIR"
-OUT_DIR="$(cd "$OUT_DIR" && pwd)"
-APP="$OUT_DIR/Heed.app"
-ZIP_NAME="Heed-${VERSION}-${TRIPLE}.app.zip"
-ZIP="$OUT_DIR/$ZIP_NAME"
-
-log "Assembling $APP (version $VERSION, $TRIPLE)"
-rm -rf "$APP" "$ZIP" "$ZIP.sha256"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents"
-
-sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUNDLE_VERSION__/${BUNDLE_VERSION}/g" \
-    "$RES_DIR/Info.plist" > "$APP/Contents/Info.plist"
-grep -q '__' "$APP/Contents/Info.plist" && die "version template not fully substituted"
-cp "$RES_DIR/dev.heed.agent.plist" "$APP/Contents/Library/LaunchAgents/dev.heed.agent.plist"
-cp "$RES_DIR/Heed.icns" "$APP/Contents/Resources/Heed.icns"
-cp "$BINARY" "$APP/Contents/MacOS/heed"
-chmod 755 "$APP/Contents/MacOS/heed"
-plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/dev.heed.agent.plist"
-
-# Finder metadata / resource forks on any file make codesign refuse the bundle.
-xattr -cr "$APP"
-
 # Refuse a binary whose deployment target is below macOS 13: SMAppService is
 # unavailable there, and a `cargo install --git` build (outside this
 # checkout, so without .cargo/config.toml's MACOSX_DEPLOYMENT_TARGET) would
 # silently carry the SDK default.
-LOAD_CMDS="$(otool -l "$APP/Contents/MacOS/heed")"
-log "Deployment target of bundled binary:"
+LOAD_CMDS="$(otool -l "$BINARY")"
+log "Deployment target of $BINARY:"
 printf '%s\n' "$LOAD_CMDS" | grep -A4 LC_BUILD_VERSION | grep -E 'platform|minos|sdk' || true
 MINOS="$(printf '%s\n' "$LOAD_CMDS" | awk '
     /LC_BUILD_VERSION/ { in_build = 1; next }
@@ -158,6 +134,31 @@ if [ "$MINOS_MAJOR" -lt "$MIN_MINOS_MAJOR" ] || { [ "$MINOS_MAJOR" -eq "$MIN_MIN
     die "$BINARY was linked for macOS $MINOS; Heed.app needs a deployment target of at least $MIN_MINOS_MAJOR.$MIN_MINOS_MINOR (SMAppService). Build it inside this checkout (cargo build --release picks up MACOSX_DEPLOYMENT_TARGET=13.0 from .cargo/config.toml), not with cargo install."
 fi
 log "Deployment target $MINOS >= $MIN_MINOS_MAJOR.$MIN_MINOS_MINOR: ok"
+
+# --- assemble --------------------------------------------------------------
+
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+APP="$OUT_DIR/Heed.app"
+ZIP_NAME="Heed-${VERSION}-${TRIPLE}.app.zip"
+ZIP="$OUT_DIR/$ZIP_NAME"
+
+log "Assembling $APP (version $VERSION, $TRIPLE)"
+rm -rf "$APP" "$ZIP" "$ZIP.sha256"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents"
+
+sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUNDLE_VERSION__/${BUNDLE_VERSION}/g" \
+    "$RES_DIR/Info.plist" > "$APP/Contents/Info.plist"
+grep -q '__' "$APP/Contents/Info.plist" && die "version template not fully substituted"
+cp "$RES_DIR/dev.heed.agent.plist" "$APP/Contents/Library/LaunchAgents/dev.heed.agent.plist"
+cp "$RES_DIR/Heed.icns" "$APP/Contents/Resources/Heed.icns"
+cp "$BINARY" "$APP/Contents/MacOS/heed"
+chmod 755 "$APP/Contents/MacOS/heed"
+plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/dev.heed.agent.plist"
+
+# Finder metadata / resource forks on any file make codesign refuse the bundle.
+xattr -cr "$APP"
+
 
 # --- sign ------------------------------------------------------------------
 

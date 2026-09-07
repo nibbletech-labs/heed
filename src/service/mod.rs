@@ -165,9 +165,34 @@ pub fn cli_symlink_path(home: &Path) -> PathBuf {
 }
 
 /// Scratch name beside [`cli_symlink_path`] used to swap the link in
-/// atomically. Per-pid so two concurrent installs never share it.
+/// atomically. A fixed name: every run sweeps any `.heed*.tmp` left behind
+/// by an earlier one before creating its own, so a per-pid name would buy
+/// nothing (concurrent `heed install`s are not supported anyway).
 pub fn cli_symlink_temp_path(home: &Path) -> PathBuf {
-    home.join(format!(".heed/bin/.heed.{}.tmp", std::process::id()))
+    home.join(".heed/bin/.heed.tmp")
+}
+
+/// Whether `name` is a symlink-swap scratch entry (`.heed.tmp`, or the
+/// `.heed.<pid>.tmp` form) that an interrupted run may have orphaned.
+fn is_symlink_temp_name(name: &str) -> bool {
+    name.starts_with(".heed") && name.ends_with(".tmp")
+}
+
+/// Remove every orphaned scratch entry in `dir` (see [`is_symlink_temp_name`]).
+fn remove_stale_symlink_temps(dir: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+        if is_symlink_temp_name(&entry.file_name().to_string_lossy()) {
+            let path = entry.path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", path.display())),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `~/.heed/bin/heed -> target`. Creates `~/.heed/bin`, replaces any existing
@@ -198,14 +223,10 @@ pub fn ensure_cli_symlink(home: &Path, target: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("stat {}: {e}", link.display())),
     }
 
+    // Stale scratch entries from an interrupted earlier run (any pid) are
+    // ours to clear; one at our own name would make symlink() fail EEXIST.
+    remove_stale_symlink_temps(dir)?;
     let temp = cli_symlink_temp_path(home);
-    // A stale entry from an interrupted earlier run would make symlink()
-    // fail with EEXIST; it is ours to clear.
-    match std::fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("remove {}: {e}", temp.display())),
-    }
     std::os::unix::fs::symlink(target, &temp)
         .map_err(|e| format!("symlink {} -> {}: {e}", temp.display(), target.display()))?;
     std::fs::rename(&temp, &link).map_err(|e| {
@@ -294,11 +315,24 @@ mod tests {
 
         // Replacing an existing link never removes it first: a stale temp
         // entry is cleared, the new link is created there, then renamed.
+        // A temp orphaned by an earlier run under another pid goes too.
         let target_b = home.join("B.app/Contents/MacOS/heed");
         std::fs::write(&stale, b"stale").unwrap();
+        let orphan = link.parent().unwrap().join(".heed.99999.tmp");
+        std::os::unix::fs::symlink("/nonexistent/older", &orphan).unwrap();
         ensure_cli_symlink(home, &target_b).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), target_b);
+        assert!(!orphan.exists() && orphan.symlink_metadata().is_err());
         assert_eq!(bin_dir_entries(home), vec!["heed".to_string()]);
+    }
+
+    #[test]
+    fn symlink_temp_names_cover_fixed_and_per_pid_forms() {
+        assert!(is_symlink_temp_name(".heed.tmp"));
+        assert!(is_symlink_temp_name(".heed.99999.tmp"));
+        assert!(!is_symlink_temp_name("heed"));
+        assert!(!is_symlink_temp_name(".heed"));
+        assert!(!is_symlink_temp_name("other.tmp"));
     }
 
     #[test]
