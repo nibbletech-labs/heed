@@ -9,7 +9,7 @@ use crossterm::{
 };
 
 use crate::daemon::state_writer::StateFile;
-use crate::state::{Activity, Liveness, ThreadState};
+use crate::state::{Activity, Liveness, NodeKind, ThreadState};
 
 #[derive(Clone, Debug)]
 pub struct StatusArgs {
@@ -80,7 +80,17 @@ fn sort_threads(threads: &mut [&ThreadState]) {
 }
 
 fn render_terminal(state: &StateFile, args: &StatusArgs) -> Result<(), String> {
-    let mut threads: Vec<&ThreadState> = state.threads.values().collect();
+    // Agents are listed under their session, not as sessions of their own.
+    let agents: Vec<&ThreadState> = state
+        .threads
+        .values()
+        .filter(|t| t.kind == NodeKind::Subagent)
+        .collect();
+    let mut threads: Vec<&ThreadState> = state
+        .threads
+        .values()
+        .filter(|t| t.kind == NodeKind::Session)
+        .collect();
     let gone_count = threads
         .iter()
         .filter(|t| t.liveness == Liveness::Gone)
@@ -120,6 +130,20 @@ fn render_terminal(state: &StateFile, args: &StatusArgs) -> Result<(), String> {
     } else {
         for t in &threads {
             render_row(&mut stdout, t, args.ascii)?;
+            let mut own: Vec<&&ThreadState> = agents
+                .iter()
+                .filter(|a| a.parent_thread_id.as_deref() == Some(t.thread_id.as_str()))
+                .filter(|a| a.activity != Activity::Idle || args.all)
+                .collect();
+            own.sort_by(|a, b| a.first_seen.total_cmp(&b.first_seen));
+            for a in own {
+                let label = a.agent_type.as_deref().unwrap_or("agent");
+                let _ = writeln!(
+                    stdout,
+                    "      └ {label} · {}",
+                    a.subtitle.as_deref().unwrap_or("")
+                );
+            }
         }
     }
 
@@ -268,6 +292,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: Default::default(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         }
     }
 
@@ -309,6 +339,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: Default::default(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         };
         let idle_new = make(Activity::Idle, 100.0);
         let working_new = make(Activity::Working, 90.0);

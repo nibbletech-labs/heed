@@ -346,6 +346,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: Default::default(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         };
         assert_eq!(format_for_thread(&state), "Awaiting input");
         state.activity = Activity::Idle;
@@ -380,6 +386,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: Default::default(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         };
         assert_eq!(format_for_thread(&state), "Plan mode · Reading foo.rs");
         state.activity = Activity::AwaitingInput;

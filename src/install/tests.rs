@@ -28,6 +28,10 @@ fn install_creates_heed_dir_and_subdirs() {
 fn install_extracts_all_hook_scripts_with_correct_mode() {
     let tmp = tempdir().unwrap();
     install(&opts(tmp.path())).unwrap();
+    for name in &["subagent-start.sh", "subagent-stop.sh", "teammate-idle.sh"] {
+        let path = tmp.path().join(".heed/claude-hooks").join(name);
+        assert!(path.exists(), "missing: {path:?}");
+    }
     for cli in &["claude-hooks", "codex-hooks"] {
         for name in &[
             "user-prompt-submit.sh",

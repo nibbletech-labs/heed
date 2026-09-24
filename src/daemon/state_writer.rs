@@ -98,6 +98,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: VecDeque::new(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         }
     }
 

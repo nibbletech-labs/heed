@@ -41,6 +41,19 @@ pub enum Liveness {
     Gone,
 }
 
+/// What a state record stands for. `Session` is a native CLI session (the only
+/// kind before HD-15); `Subagent` is an agent running inside one — an
+/// Agent/Task subagent or an in-process named teammate — keyed
+/// `"<session id>:<agent id>"` and linked back through `parent_thread_id`.
+/// See `docs/SUBAGENT-TRACKING.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeKind {
+    #[default]
+    Session,
+    Subagent,
+}
+
 /// Composite key for the `(cli, thread_id)` pair the daemon uses to dedupe.
 /// Native session UUIDs are globally unique in practice, but pairing with
 /// `cli` is cheap insurance.
@@ -99,6 +112,27 @@ pub struct ThreadState {
     /// [`RECENT_EVENTS_CAP`]; oldest entries drop off as new ones land.
     #[serde(default)]
     pub recent_events: VecDeque<RecentEvent>,
+    /// Session or agent record (HD-15).
+    #[serde(default)]
+    pub kind: NodeKind,
+    /// Agent records only: Claude Code's id for the agent instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Agent records only: the agent's type or name (e.g. `Explore`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Agent records only: the session (`thread_id`) the agent runs inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    /// Session records, as written to state.json: the session's own state,
+    /// before its agents are rolled into `activity`. In memory the daemon
+    /// keeps the session's own state in `activity` and rolls up at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_activity: Option<Activity>,
+    /// Session records, as written to state.json: how many of its agents are
+    /// working right now.
+    #[serde(default)]
+    pub agents_active: u32,
 }
 
 pub const RECENT_EVENTS_CAP: usize = 10;
@@ -124,6 +158,12 @@ pub enum HookEventKind {
     /// Reserved for v0.2 `SessionEnd` hook (SPEC §5.4 / §13). Reducer marks
     /// the thread `gone` immediately.
     SessionEnd,
+    /// Claude `SubagentStart`: an agent began (or was resumed) inside a session.
+    SubagentStart,
+    /// Claude `SubagentStop`: an agent finished and handed back.
+    SubagentStop,
+    /// Claude `TeammateIdle`: a named teammate finished its task and is idle.
+    AgentIdle,
 }
 
 /// One parsed line from `events.jsonl`.
@@ -140,6 +180,12 @@ pub struct HookEvent {
     pub cwd: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// Set by Claude when the event comes from an agent inside the session
+    /// (`thread_id` is then the parent session's id). HD-15.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     #[serde(default)]
     pub extra: HookEventExtra,
 }
@@ -163,6 +209,17 @@ impl HookEvent {
         (self.cli, self.thread_id.clone())
     }
 
+    /// The agent that emitted this event, when it came from inside a session.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// Key of the agent record this event belongs to, if any.
+    pub fn agent_key(&self) -> Option<ThreadKey> {
+        self.agent_id()
+            .map(|a| (self.cli, agent_thread_id(&self.thread_id, a)))
+    }
+
     fn truthy_string(s: &Option<String>) -> Option<String> {
         s.as_ref().filter(|v| !v.is_empty()).cloned()
     }
@@ -174,6 +231,11 @@ impl HookEvent {
     pub fn tool_target(&self) -> Option<&str> {
         self.extra.tool_target.as_deref().filter(|s| !s.is_empty())
     }
+}
+
+/// `thread_id` of an agent record: `"<session id>:<agent id>"`.
+pub fn agent_thread_id(session: &str, agent: &str) -> String {
+    format!("{session}:{agent}")
 }
 
 /// Codezilla meta-tool list (Terminal.tsx::isMetaTool, line 507–512).
@@ -210,6 +272,60 @@ pub fn initial_state(ev: &HookEvent) -> ThreadState {
         supersedes: None,
         superseded_by: None,
         recent_events: VecDeque::with_capacity(RECENT_EVENTS_CAP),
+        kind: NodeKind::Session,
+        agent_id: None,
+        agent_type: None,
+        parent_thread_id: None,
+        own_activity: None,
+        agents_active: 0,
+    }
+}
+
+/// Initial state for an agent seen for the first time (`ev` carries `agent_id`).
+pub fn initial_agent_state(ev: &HookEvent) -> ThreadState {
+    let mut state = initial_state(ev);
+    let agent = ev.agent_id().unwrap_or_default().to_string();
+    state.thread_id = agent_thread_id(&ev.thread_id, &agent);
+    state.kind = NodeKind::Subagent;
+    state.agent_id = Some(agent);
+    state.agent_type = HookEvent::truthy_string(&ev.agent_type);
+    state.parent_thread_id = Some(ev.thread_id.clone());
+    state
+}
+
+/// Apply an event from an agent to that agent's record. Agents have no
+/// post-stop scan: start and tool events mean working, stop and idle mean
+/// idle, and a permission prompt inside a foreground agent means the user is
+/// being asked something.
+pub fn apply_agent_event(mut state: ThreadState, ev: &HookEvent) -> ThreadState {
+    if state.agent_type.is_none() {
+        state.agent_type = HookEvent::truthy_string(&ev.agent_type);
+    }
+    match ev.event {
+        HookEventKind::SubagentStop | HookEventKind::AgentIdle | HookEventKind::TurnEnd => {
+            state.last_event = ev.ts;
+            state.liveness = Liveness::Live;
+            push_recent(&mut state, ev);
+            state.activity = Activity::Idle;
+            state
+        }
+        HookEventKind::SubagentStart => {
+            state.last_event = ev.ts;
+            state.liveness = Liveness::Live;
+            push_recent(&mut state, ev);
+            state.activity = Activity::Working;
+            // A resumed agent starts fresh, like a session's new turn.
+            state.last_tool_name = None;
+            state.last_tool_target = None;
+            state
+        }
+        HookEventKind::SessionEnd => {
+            state.last_event = ev.ts;
+            state.liveness = Liveness::Gone;
+            state.activity = Activity::Idle;
+            state
+        }
+        _ => apply_event(state, ev),
     }
 }
 
@@ -342,6 +458,10 @@ pub fn apply_event(mut state: ThreadState, ev: &HookEvent) -> ThreadState {
             // A dead thread isn't working — don't leave activity frozen mid-turn.
             state.activity = Activity::Idle;
         }
+        // Agent lifecycle events belong to the agent's own record (the daemon
+        // routes them there). Without an agent id they carry nothing for the
+        // session itself.
+        HookEventKind::SubagentStart | HookEventKind::SubagentStop | HookEventKind::AgentIdle => {}
     }
 
     state
@@ -401,6 +521,8 @@ mod tests {
             pid_start: "Mon Jan 1 00:00:00 2026".into(),
             cwd: Some("/cwd".into()),
             transcript_path: Some("/transcript.jsonl".into()),
+            agent_id: None,
+            agent_type: None,
             extra: HookEventExtra {
                 tool_name: tool.map(str::to_string),
                 tool_target: target.map(str::to_string),

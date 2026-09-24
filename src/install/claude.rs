@@ -30,6 +30,9 @@ pub(super) fn build_hooks_block(scripts_dir: &Path) -> Value {
         "PostToolUse": [entry("post-tool-use.sh")],
         "Stop": [entry("stop.sh")],
         "SessionEnd": [entry("session-end.sh")],
+        "SubagentStart": [entry("subagent-start.sh")],
+        "SubagentStop": [entry("subagent-stop.sh")],
+        "TeammateIdle": [entry("teammate-idle.sh")],
     })
 }
 
@@ -192,6 +195,9 @@ mod unit_tests {
         assert!(obj.contains_key("PreToolUse"));
         assert!(obj.contains_key("PostToolUse"));
         assert!(obj.contains_key("Stop"));
+        assert!(obj.contains_key("SubagentStart"));
+        assert!(obj.contains_key("SubagentStop"));
+        assert!(obj.contains_key("TeammateIdle"));
         let stop_arr = obj["Stop"].as_array().unwrap();
         let cmd = stop_arr[0]["hooks"].as_array().unwrap()[0]["command"]
             .as_str()

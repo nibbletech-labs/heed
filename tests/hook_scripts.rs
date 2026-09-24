@@ -232,6 +232,59 @@ fn claude_stop_emits_turn_end() {
     assert!(v["transcript_path"].is_string());
 }
 
+const AGENT_PRE_TOOL: &str = r#"{"session_id":"sess-1","transcript_path":"/t/sess-1.jsonl","cwd":"/repo","hook_event_name":"PreToolUse","agent_id":"a42f","agent_type":"Explore","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+
+#[test]
+fn claude_agent_tool_call_carries_agent_id_and_type() {
+    let v = run_hook(&script("claude", "pre-tool-use.sh"), AGENT_PRE_TOOL);
+    assert_eq!(v["event"], "pre_tool_use");
+    assert_eq!(v["thread_id"], "sess-1");
+    assert_eq!(v["agent_id"], "a42f");
+    assert_eq!(v["agent_type"], "Explore");
+    assert_eq!(v["extra"]["tool_name"], "Bash");
+}
+
+#[test]
+fn claude_main_session_tool_call_has_no_agent_id() {
+    // The session's own Agent tool call: an id inside the tool's input or
+    // response must not be read as the caller's.
+    let stdin = r#"{"session_id":"sess-1","transcript_path":"/t/sess-1.jsonl","cwd":"/repo","hook_event_name":"PostToolUse","tool_name":"Agent","tool_input":{"description":"x","agent_id":"inner"},"tool_response":{"agent_id":"inner2"}}"#;
+    let v = run_hook(&script("claude", "post-tool-use.sh"), stdin);
+    assert_eq!(v["event"], "tool_use");
+    assert!(v.get("agent_id").is_none(), "{v}");
+}
+
+#[test]
+fn claude_subagent_start_and_stop_emit_lifecycle_events() {
+    let start = r#"{"session_id":"sess-1","transcript_path":"/t/sess-1.jsonl","cwd":"/repo","hook_event_name":"SubagentStart","agent_id":"a42f","agent_type":"Explore"}"#;
+    let v = run_hook(&script("claude", "subagent-start.sh"), start);
+    assert_eq!(v["event"], "subagent_start");
+    assert_eq!(v["thread_id"], "sess-1");
+    assert_eq!(v["agent_id"], "a42f");
+    assert_eq!(v["agent_type"], "Explore");
+
+    let stop = r#"{"session_id":"sess-1","transcript_path":"/t/sess-1.jsonl","cwd":"/repo","hook_event_name":"SubagentStop","agent_id":"a42f","agent_type":"Explore","last_assistant_message":"done"}"#;
+    let v = run_hook(&script("claude", "subagent-stop.sh"), stop);
+    assert_eq!(v["event"], "subagent_stop");
+    assert_eq!(v["agent_id"], "a42f");
+}
+
+#[test]
+fn claude_teammate_idle_emits_agent_idle() {
+    let idle = r#"{"session_id":"sess-1","cwd":"/repo","hook_event_name":"TeammateIdle","agent_id":"t1","agent_type":"builder"}"#;
+    let v = run_hook(&script("claude", "teammate-idle.sh"), idle);
+    assert_eq!(v["event"], "agent_idle");
+    assert_eq!(v["agent_id"], "t1");
+}
+
+#[test]
+fn claude_agent_lifecycle_without_agent_id_is_silent() {
+    let stdin = r#"{"session_id":"sess-1","cwd":"/repo","hook_event_name":"SubagentStart"}"#;
+    run_hook_expect_silent(&script("claude", "subagent-start.sh"), stdin);
+    run_hook_expect_silent(&script("claude", "subagent-stop.sh"), stdin);
+    run_hook_expect_silent(&script("claude", "teammate-idle.sh"), stdin);
+}
+
 #[test]
 fn claude_session_end_emits_session_end() {
     let v = run_hook(

@@ -156,7 +156,12 @@ fn visible_threads(state: &Option<StateFile>, show_gone: bool) -> Vec<&ThreadSta
     let Some(state) = state else {
         return Vec::new();
     };
-    let mut threads: Vec<&ThreadState> = state.threads.values().collect();
+    // Agent records (HD-15) belong to their session; the list shows sessions.
+    let mut threads: Vec<&ThreadState> = state
+        .threads
+        .values()
+        .filter(|t| t.kind == crate::state::NodeKind::Session)
+        .collect();
     if !show_gone {
         threads.retain(|t| t.liveness == Liveness::Live);
     }
@@ -350,6 +355,9 @@ fn event_kind_label(k: crate::state::HookEventKind) -> &'static str {
         ToolUse => "tool_use",
         TurnEnd => "turn_end",
         SessionEnd => "session_end",
+        SubagentStart => "agent_start",
+        SubagentStop => "agent_stop",
+        AgentIdle => "agent_idle",
     }
 }
 
@@ -434,6 +442,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: VecDeque::new(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         }
     }
 

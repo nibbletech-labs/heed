@@ -34,6 +34,12 @@ fn dummy_thread(id: &str) -> ThreadState {
         supersedes: None,
         superseded_by: None,
         recent_events: Default::default(),
+        kind: heed::state::NodeKind::Session,
+        agent_id: None,
+        agent_type: None,
+        parent_thread_id: None,
+        own_activity: None,
+        agents_active: 0,
     }
 }
 

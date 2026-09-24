@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use crate::liveness::{self, LivenessCheck};
 use crate::state::{
-    apply_event, initial_state, Activity, HookEvent, HookEventKind, Liveness, ThreadKey,
-    ThreadState,
+    apply_event, initial_state, Activity, Cli, HookEvent, HookEventKind, Liveness, NodeKind,
+    ThreadKey, ThreadState,
 };
 use crate::succession;
 use crate::tool_display;
@@ -86,7 +86,7 @@ impl Default for DaemonConfig {
 /// (`run_loop`), so all state mutations serialize through this channel.
 #[derive(Debug)]
 pub enum DaemonEvent {
-    Hook(HookEvent),
+    Hook(Box<HookEvent>),
     /// owners.json changed; reducer re-loads and re-applies overlay.
     OwnersChanged,
     /// 30s tick: poll liveness for any thread idle > LIVENESS_EVENT_GRACE.
@@ -288,7 +288,7 @@ fn make_hook_sender(tx: Sender<DaemonEvent>) -> Sender<HookEvent> {
         .name("heed-hook-bridge".into())
         .spawn(move || {
             while let Ok(ev) = hook_rx.recv() {
-                if tx.send(DaemonEvent::Hook(ev)).is_err() {
+                if tx.send(DaemonEvent::Hook(Box::new(ev))).is_err() {
                     break;
                 }
             }
@@ -389,7 +389,7 @@ fn run_loop(
         match recv_result {
             Ok(DaemonEvent::Hook(ev)) => {
                 handle_hook(
-                    ev,
+                    *ev,
                     &mut threads,
                     &mut owners,
                     &paths.owners_file,
@@ -510,6 +510,20 @@ fn handle_hook(
     reviewer: Option<&Sender<ReviewerRequest>>,
     cfg: &DaemonConfig,
 ) {
+    // An event from an agent inside a session goes to the agent's own record
+    // and nowhere else: it must not touch the session's state, last_event or
+    // recent events (HD-15), and agents take no part in succession, owner
+    // binding or the post-stop scan.
+    if let Some(agent_key) = ev.agent_key() {
+        let current = threads
+            .remove(&agent_key)
+            .unwrap_or_else(|| crate::state::initial_agent_state(&ev));
+        let mut next = crate::state::apply_agent_event(current, &ev);
+        next.subtitle = Some(tool_display::format_for_thread(&next));
+        threads.insert(agent_key, next);
+        return;
+    }
+
     let key = ev.key();
 
     let known = threads.contains_key(&key);
@@ -712,11 +726,74 @@ fn poll_liveness(threads: &mut HashMap<ThreadKey, ThreadState>, cfg: &DaemonConf
 }
 
 fn flush_state(threads: &HashMap<ThreadKey, ThreadState>, state_path: &Path) -> Result<(), String> {
+    let now = state_writer::now_unix();
+    let rolled = roll_up_agents(threads, now);
     let mut by_key = HashMap::new();
-    for ((cli, tid), state) in threads.iter() {
-        by_key.insert(format!("{cli}:{tid}"), state.clone());
+    for ((cli, tid), state) in rolled {
+        by_key.insert(format!("{cli}:{tid}"), state);
     }
     state_writer::write(state_path, &state_writer::build_state_file(by_key))
+}
+
+/// An agent with no hook event for this long no longer counts as working for
+/// its session's roll-up. A generous bound: a single long tool call (a cold
+/// build) emits nothing until it finishes. It only guards against an agent
+/// whose stop never arrived keeping its session "working" forever.
+pub const AGENT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// The records as written to state.json. Each session's own state moves to
+/// `own_activity`, `agents_active` counts its working agents, and `activity`
+/// becomes the roll-up consumers read: awaiting input if the session or one of
+/// its live agents is asking something, else working if the session or any
+/// agent is working, else the session's own state.
+pub fn roll_up_agents(
+    threads: &HashMap<ThreadKey, ThreadState>,
+    now_unix: f64,
+) -> HashMap<ThreadKey, ThreadState> {
+    let mut active: HashMap<(Cli, String), u32> = HashMap::new();
+    let mut asking: HashMap<(Cli, String), bool> = HashMap::new();
+    for ((cli, _), agent) in threads {
+        if agent.kind != NodeKind::Subagent || agent.liveness != Liveness::Live {
+            continue;
+        }
+        let Some(parent) = agent.parent_thread_id.clone() else {
+            continue;
+        };
+        let fresh = now_unix - agent.last_event < AGENT_STALE_AFTER.as_secs_f64();
+        match agent.activity {
+            Activity::Working if fresh => *active.entry((*cli, parent)).or_default() += 1,
+            Activity::AwaitingInput if fresh => {
+                asking.insert((*cli, parent), true);
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = HashMap::with_capacity(threads.len());
+    for (key, state) in threads {
+        let mut state = state.clone();
+        if state.kind == NodeKind::Session {
+            let own = state.activity;
+            let n = active.get(key).copied().unwrap_or(0);
+            let agent_asking = asking.get(key).copied().unwrap_or(false);
+            state.own_activity = Some(own);
+            state.agents_active = n;
+            if state.liveness == Liveness::Live {
+                state.activity = if own == Activity::AwaitingInput || agent_asking {
+                    Activity::AwaitingInput
+                } else if own == Activity::Working || n > 0 {
+                    Activity::Working
+                } else {
+                    own
+                };
+                if state.activity != own {
+                    state.subtitle = Some(tool_display::format_for_thread(&state));
+                }
+            }
+        }
+        out.insert(key.clone(), state);
+    }
+    out
 }
 
 /// Process events from a slice without spawning any threads. Used by tests
@@ -729,6 +806,15 @@ pub fn run_events_in_memory(
 ) -> HashMap<ThreadKey, ThreadState> {
     let mut threads: HashMap<ThreadKey, ThreadState> = HashMap::new();
     for ev in events {
+        if let Some(agent_key) = ev.agent_key() {
+            let current = threads
+                .remove(&agent_key)
+                .unwrap_or_else(|| crate::state::initial_agent_state(&ev));
+            let mut next = crate::state::apply_agent_event(current, &ev);
+            next.subtitle = Some(tool_display::format_for_thread(&next));
+            threads.insert(agent_key, next);
+            continue;
+        }
         let key = ev.key();
         let current = threads.remove(&key).unwrap_or_else(|| initial_state(&ev));
         let mut next = apply_event(current, &ev);
@@ -763,6 +849,8 @@ mod tests {
             pid_start: "stable".into(),
             cwd: None,
             transcript_path: None,
+            agent_id: None,
+            agent_type: None,
             extra: HookEventExtra {
                 tool_name: tool.map(str::to_string),
                 ..Default::default()
@@ -1039,6 +1127,276 @@ mod tests {
         assert!(!apply_post_stop_scan(state, ts));
         assert_eq!(state.activity, Activity::Working);
         assert_eq!(state.subtitle.as_deref(), Some("Working"));
+    }
+
+    fn agent_ev(kind: HookEventKind, ts: f64, agent: &str, tool: Option<&str>) -> HookEvent {
+        let mut e = ev(kind, ts, Cli::Claude, "s", tool);
+        e.agent_id = Some(agent.into());
+        e.agent_type = Some("general-purpose".into());
+        e
+    }
+
+    fn session_key() -> ThreadKey {
+        (Cli::Claude, "s".into())
+    }
+
+    fn agent_key(agent: &str) -> ThreadKey {
+        (Cli::Claude, format!("s:{agent}"))
+    }
+
+    #[test]
+    fn agent_events_get_their_own_record_and_leave_the_session_alone() {
+        let threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                ev(
+                    HookEventKind::PreToolUse,
+                    2.0,
+                    Cli::Claude,
+                    "s",
+                    Some("Agent"),
+                ),
+                agent_ev(HookEventKind::SubagentStart, 3.0, "a1", None),
+                agent_ev(HookEventKind::PreToolUse, 4.0, "a1", Some("Bash")),
+            ],
+            HashMap::new(),
+        );
+        let session = &threads[&session_key()];
+        assert_eq!(session.last_event, 2.0);
+        assert_eq!(session.last_tool_name.as_deref(), Some("Agent"));
+        assert_eq!(session.recent_events.len(), 2);
+        assert_eq!(session.kind, NodeKind::Session);
+
+        let agent = &threads[&agent_key("a1")];
+        assert_eq!(agent.kind, NodeKind::Subagent);
+        assert_eq!(agent.thread_id, "s:a1");
+        assert_eq!(agent.agent_id.as_deref(), Some("a1"));
+        assert_eq!(agent.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(agent.parent_thread_id.as_deref(), Some("s"));
+        assert_eq!(agent.activity, Activity::Working);
+        assert_eq!(agent.last_tool_name.as_deref(), Some("Bash"));
+        assert!(agent.owner_thread_id.is_none());
+    }
+
+    #[test]
+    fn a_background_agent_cannot_hide_a_question_to_the_user() {
+        let mut threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::SubagentStart, 2.0, "a1", None),
+                ev(HookEventKind::TurnEnd, 3.0, Cli::Claude, "s", None),
+            ],
+            HashMap::new(),
+        );
+        // The post-stop scan found a question.
+        let s = threads.get_mut(&session_key()).unwrap();
+        *s = crate::state::resolve_post_stop(s.clone(), crate::state::PostStopResult::Question);
+        // The agent keeps working afterwards.
+        let key = agent_key("a1");
+        let a = threads.remove(&key).unwrap();
+        threads.insert(
+            key,
+            crate::state::apply_agent_event(
+                a,
+                &agent_ev(HookEventKind::PreToolUse, 4.0, "a1", Some("Bash")),
+            ),
+        );
+        assert_eq!(threads[&session_key()].activity, Activity::AwaitingInput);
+        let rolled = roll_up_agents(&threads, 5.0);
+        let session = &rolled[&session_key()];
+        assert_eq!(session.activity, Activity::AwaitingInput);
+        assert_eq!(session.own_activity, Some(Activity::AwaitingInput));
+        assert_eq!(session.agents_active, 1);
+    }
+
+    #[test]
+    fn an_agent_event_does_not_supersede_the_post_stop_scan() {
+        let mut threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                ev(HookEventKind::TurnEnd, 2.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::PreToolUse, 3.0, "a1", Some("Bash")),
+            ],
+            HashMap::new(),
+        );
+        let s = threads.get_mut(&session_key()).unwrap();
+        assert!(apply_post_stop_scan(s, 2.0));
+        assert_eq!(s.activity, Activity::Idle);
+    }
+
+    #[test]
+    fn a_session_stays_working_while_its_agents_work_then_goes_idle() {
+        let mut threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::SubagentStart, 2.0, "a1", None),
+                agent_ev(HookEventKind::SubagentStart, 2.5, "a2", None),
+                ev(HookEventKind::TurnEnd, 3.0, Cli::Claude, "s", None),
+            ],
+            HashMap::new(),
+        );
+        let s = threads.get_mut(&session_key()).unwrap();
+        assert!(apply_post_stop_scan(s, 3.0));
+        assert_eq!(s.activity, Activity::Idle);
+
+        let rolled = roll_up_agents(&threads, 4.0);
+        assert_eq!(rolled[&session_key()].activity, Activity::Working);
+        assert_eq!(rolled[&session_key()].agents_active, 2);
+        assert_eq!(rolled[&session_key()].own_activity, Some(Activity::Idle));
+
+        for (agent, ts) in [("a1", 5.0), ("a2", 6.0)] {
+            let key = agent_key(agent);
+            let a = threads.remove(&key).unwrap();
+            threads.insert(
+                key,
+                crate::state::apply_agent_event(
+                    a,
+                    &agent_ev(HookEventKind::SubagentStop, ts, agent, None),
+                ),
+            );
+        }
+        let rolled = roll_up_agents(&threads, 7.0);
+        assert_eq!(rolled[&session_key()].activity, Activity::Idle);
+        assert_eq!(rolled[&session_key()].agents_active, 0);
+        // A resumed agent counts again.
+        let key = agent_key("a1");
+        let a = threads.remove(&key).unwrap();
+        threads.insert(
+            key,
+            crate::state::apply_agent_event(
+                a,
+                &agent_ev(HookEventKind::PreToolUse, 8.0, "a1", Some("Read")),
+            ),
+        );
+        assert_eq!(
+            roll_up_agents(&threads, 9.0)[&session_key()].activity,
+            Activity::Working
+        );
+    }
+
+    #[test]
+    fn a_teammate_going_idle_stops_counting() {
+        let threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::PreToolUse, 2.0, "t1", Some("Bash")),
+                agent_ev(HookEventKind::AgentIdle, 3.0, "t1", None),
+                ev(HookEventKind::TurnEnd, 4.0, Cli::Claude, "s", None),
+            ],
+            HashMap::new(),
+        );
+        let mut threads = threads;
+        let s = threads.get_mut(&session_key()).unwrap();
+        assert!(apply_post_stop_scan(s, 4.0));
+        let rolled = roll_up_agents(&threads, 5.0);
+        assert_eq!(rolled[&session_key()].activity, Activity::Idle);
+        assert_eq!(rolled[&agent_key("t1")].activity, Activity::Idle);
+        assert_eq!(rolled[&agent_key("t1")].liveness, Liveness::Live);
+    }
+
+    #[test]
+    fn a_foreground_agent_permission_prompt_asks_through_its_session() {
+        let threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(
+                    HookEventKind::PreToolUse,
+                    2.0,
+                    "a1",
+                    Some("PermissionRequest"),
+                ),
+            ],
+            HashMap::new(),
+        );
+        let rolled = roll_up_agents(&threads, 3.0);
+        assert_eq!(rolled[&agent_key("a1")].activity, Activity::AwaitingInput);
+        assert_eq!(rolled[&session_key()].activity, Activity::AwaitingInput);
+        assert_eq!(rolled[&session_key()].own_activity, Some(Activity::Working));
+    }
+
+    #[test]
+    fn a_stale_or_orphaned_agent_does_not_hold_its_session_working() {
+        let mut threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::PreToolUse, 2.0, "a1", Some("Bash")),
+                ev(HookEventKind::TurnEnd, 3.0, Cli::Claude, "s", None),
+            ],
+            HashMap::new(),
+        );
+        let s = threads.get_mut(&session_key()).unwrap();
+        assert!(apply_post_stop_scan(s, 3.0));
+        let later = 2.0 + AGENT_STALE_AFTER.as_secs_f64() + 1.0;
+        let rolled = roll_up_agents(&threads, later);
+        assert_eq!(rolled[&session_key()].activity, Activity::Idle);
+        assert_eq!(rolled[&session_key()].agents_active, 0);
+
+        // A session that has gone keeps its own (idle) state.
+        let s = threads.get_mut(&session_key()).unwrap();
+        s.liveness = Liveness::Gone;
+        let rolled = roll_up_agents(&threads, 4.0);
+        assert_eq!(rolled[&session_key()].activity, Activity::Idle);
+    }
+
+    #[test]
+    fn a_rotated_session_never_links_to_an_agent_record() {
+        // Same process (pid + pid_start) as the old session and its agent.
+        let mut threads = run_events_in_memory(
+            vec![
+                ev(HookEventKind::TurnStart, 1.0, Cli::Claude, "s", None),
+                agent_ev(HookEventKind::PreToolUse, 2.0, "a1", Some("Bash")),
+            ],
+            HashMap::new(),
+        );
+        // Make the agent record the only candidate a kind-blind lookup could pick.
+        threads.get_mut(&session_key()).unwrap().superseded_by = Some("elsewhere".into());
+        let rotated = ev(HookEventKind::TurnStart, 3.0, Cli::Claude, "s2", None);
+        let owned: HashMap<ThreadKey, ()> = HashMap::new();
+        assert_eq!(
+            succession::resolve_predecessor(&rotated, &threads, &owned),
+            None
+        );
+        threads.get_mut(&session_key()).unwrap().superseded_by = None;
+        assert_eq!(
+            succession::resolve_predecessor(&rotated, &threads, &owned),
+            Some(session_key())
+        );
+    }
+
+    #[test]
+    fn a_resumed_agent_drops_its_previous_tool() {
+        let threads = run_events_in_memory(
+            vec![
+                agent_ev(HookEventKind::PreToolUse, 1.0, "a1", Some("Bash")),
+                agent_ev(HookEventKind::SubagentStop, 2.0, "a1", None),
+                agent_ev(HookEventKind::SubagentStart, 3.0, "a1", None),
+            ],
+            HashMap::new(),
+        );
+        let agent = &threads[&agent_key("a1")];
+        assert_eq!(agent.activity, Activity::Working);
+        assert!(agent.last_tool_name.is_none());
+        assert_eq!(agent.subtitle.as_deref(), Some("Working"));
+    }
+
+    #[test]
+    fn a_session_without_agents_writes_what_it_always_did() {
+        let threads = run_events_in_memory(
+            vec![ev(
+                HookEventKind::PreToolUse,
+                1.0,
+                Cli::Claude,
+                "s",
+                Some("Read"),
+            )],
+            HashMap::new(),
+        );
+        let before = &threads[&session_key()];
+        let after = &roll_up_agents(&threads, 2.0)[&session_key()];
+        assert_eq!(after.activity, before.activity);
+        assert_eq!(after.subtitle, before.subtitle);
+        assert_eq!(after.own_activity, Some(before.activity));
+        assert_eq!(after.agents_active, 0);
     }
 
     #[test]

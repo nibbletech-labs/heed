@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# heed claude-hooks/session-end.sh — emits session_end on Claude's SessionEnd.
-# Lets the daemon mark a thread `gone` immediately on clean exit, rather
-# than waiting for the 30s liveness poll cycle.
+# heed claude-hooks/teammate-idle.sh — emits agent_idle on TeammateIdle (HD-15).
 set -eu
 
 stdin=$(cat || true)
@@ -19,6 +17,9 @@ mkdir -p "$(dirname "$event_log")"
 # a tool's input or response is never mistaken for the caller's.
 head=${stdin%%\"tool_input\":*}
 agent_id=$(printf '%s' "$head" | grep -o '"agent_id":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
+if [ -z "$agent_id" ]; then
+  agent_id=$(printf '%s' "$stdin" | grep -o '"teammate_name":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
+fi
 agent_type=""
 if [ -n "$agent_id" ]; then
   agent_type=$(printf '%s' "$head" | grep -o '"agent_type":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
@@ -28,6 +29,9 @@ fi
 if [ -e "${HOME}/.heed/debug-hooks" ]; then
   printf '%s\n' "$stdin" >> "${HOME}/.heed/hook-debug.jsonl"
 fi
+
+tpath=$(printf '%s' "$stdin" | sed -n 's/.*"transcript_path":"\([^"]*\)".*/\1/p' | head -1)
+cwd=$(printf '%s' "$stdin" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' | head -1)
 
 ppid="${PPID:-0}"
 pid_start=""
@@ -39,6 +43,8 @@ escape_json() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+[ -z "$agent_id" ] && exit 0
+
 agent_fields=""
 if [ -n "$agent_id" ]; then
   agent_fields=',"agent_id":"'"$(escape_json "$agent_id")"'"'
@@ -47,10 +53,12 @@ if [ -n "$agent_id" ]; then
   fi
 fi
 
-printf '{"event":"session_end","ts":%s,"cli":"claude","thread_id":"%s","pid":%s,"pid_start":"%s"%s}\n' \
+printf '{"event":"agent_idle","ts":%s,"cli":"claude","thread_id":"%s","pid":%s,"pid_start":"%s","cwd":"%s","transcript_path":"%s"%s}\n' \
   "$ts" \
   "$(escape_json "$sid")" \
   "$ppid" \
   "$(escape_json "$pid_start")" \
+  "$(escape_json "$cwd")" \
+  "$(escape_json "$tpath")" \
   "$agent_fields" \
   >> "$event_log"

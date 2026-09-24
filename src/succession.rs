@@ -71,6 +71,9 @@ fn same_process_predecessor(
         .find(|((cli, tid), s)| {
             *cli == ev.cli
                 && tid.as_str() != ev.thread_id
+                // Agent records share their session's process; only a session
+                // can be the one a new session continues.
+                && s.kind == crate::state::NodeKind::Session
                 && s.pid == ev.pid
                 && s.pid_start == ev.pid_start
                 // Already handed on to a later session — link to the tip, not
@@ -210,6 +213,12 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             recent_events: VecDeque::new(),
+            kind: crate::state::NodeKind::Session,
+            agent_id: None,
+            agent_type: None,
+            parent_thread_id: None,
+            own_activity: None,
+            agents_active: 0,
         }
     }
 
@@ -223,6 +232,8 @@ mod tests {
             pid_start: pid_start.to_string(),
             cwd: None,
             transcript_path: None,
+            agent_id: None,
+            agent_type: None,
             extra: Default::default(),
         }
     }

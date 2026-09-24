@@ -43,6 +43,18 @@ const CLAUDE_HOOK_SCRIPTS: &[(&str, &str)] = &[
         "session-end.sh",
         include_str!("../../resources/claude-hooks/session-end.sh"),
     ),
+    (
+        "subagent-start.sh",
+        include_str!("../../resources/claude-hooks/subagent-start.sh"),
+    ),
+    (
+        "subagent-stop.sh",
+        include_str!("../../resources/claude-hooks/subagent-stop.sh"),
+    ),
+    (
+        "teammate-idle.sh",
+        include_str!("../../resources/claude-hooks/teammate-idle.sh"),
+    ),
 ];
 
 const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
