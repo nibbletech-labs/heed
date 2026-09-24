@@ -283,6 +283,9 @@ fn claude_agent_lifecycle_without_agent_id_is_silent() {
     run_hook_expect_silent(&script("claude", "subagent-start.sh"), stdin);
     run_hook_expect_silent(&script("claude", "subagent-stop.sh"), stdin);
     run_hook_expect_silent(&script("claude", "teammate-idle.sh"), stdin);
+    // The real TeammateIdle payload names the teammate but has no agent_id.
+    let idle = r#"{"session_id":"sess-1","cwd":"/repo","hook_event_name":"TeammateIdle","teammate_name":"builder","team_name":"session-1"}"#;
+    run_hook_expect_silent(&script("claude", "teammate-idle.sh"), idle);
 }
 
 #[test]

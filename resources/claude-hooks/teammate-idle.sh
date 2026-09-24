@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # heed claude-hooks/teammate-idle.sh — emits agent_idle on TeammateIdle (HD-15).
+# As of Claude Code 2026-09 TeammateIdle carries teammate_name and team_name but
+# no agent_id, so this stays silent; a teammate's finish is tracked through
+# SubagentStop, which does carry it.
 set -eu
 
 stdin=$(cat || true)
@@ -17,9 +20,6 @@ mkdir -p "$(dirname "$event_log")"
 # a tool's input or response is never mistaken for the caller's.
 head=${stdin%%\"tool_input\":*}
 agent_id=$(printf '%s' "$head" | grep -o '"agent_id":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
-if [ -z "$agent_id" ]; then
-  agent_id=$(printf '%s' "$stdin" | grep -o '"teammate_name":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
-fi
 agent_type=""
 if [ -n "$agent_id" ]; then
   agent_type=$(printf '%s' "$head" | grep -o '"agent_type":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/' || true)
