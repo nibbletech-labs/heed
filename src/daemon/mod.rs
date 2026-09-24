@@ -92,9 +92,10 @@ pub enum DaemonEvent {
     /// 30s tick: poll liveness for any thread idle > LIVENESS_EVENT_GRACE.
     LivenessTick,
     /// Triggered POST_STOP_SCAN_DELAY after a TurnEnd. Reducer reads the
-    /// transcript and resolves activity.
+    /// transcript and resolves activity only if this is still the latest event.
     PostStopScan {
         key: ThreadKey,
+        ts: f64,
     },
     ReviewerScanned {
         key: ThreadKey,
@@ -157,6 +158,32 @@ fn apply_reviewer_result(state: &mut ThreadState, ts: f64, auto_review: bool) ->
     } else {
         Activity::AwaitingInput
     };
+    state.subtitle = Some(tool_display::format_for_thread(state));
+    true
+}
+
+/// Resolve a delayed stop against the event that scheduled it.
+fn apply_post_stop_scan(state: &mut ThreadState, ts: f64) -> bool {
+    // New work, a newer stop, or a dead process supersedes this scan. Check
+    // before reading the transcript so a stale callback cannot settle a new
+    // turn to idle (including the fallback for an unbound Codex session).
+    if state.last_event != ts
+        || state.liveness != Liveness::Live
+        || !state
+            .recent_events
+            .back()
+            .map(|event| event.event == HookEventKind::TurnEnd)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let result = state
+        .transcript_path
+        .as_deref()
+        .map(|path| transcript::scan_post_stop(Path::new(path)))
+        .unwrap_or(crate::state::PostStopResult::Neither);
+    *state = crate::state::resolve_post_stop(state.clone(), result);
     state.subtitle = Some(tool_display::format_for_thread(state));
     true
 }
@@ -398,24 +425,10 @@ fn run_loop(
                     pending_write_at = Some(now + cfg.state_write_debounce);
                 }
             }
-            Ok(DaemonEvent::PostStopScan { key }) => {
-                if let Some(state) = threads.get(&key).cloned() {
-                    if let Some(path) = state.transcript_path.clone() {
-                        let result = transcript::scan_post_stop(Path::new(&path));
-                        if let Some(s) = threads.get_mut(&key) {
-                            *s = crate::state::resolve_post_stop(s.clone(), result);
-                            s.subtitle = Some(tool_display::format_for_thread(s));
-                            pending_write_at = Some(now + cfg.state_write_debounce);
-                        }
-                    } else if let Some(s) = threads.get_mut(&key) {
-                        // No transcript bound (e.g., Codex unbound) → fall back to Idle,
-                        // unless a pre_tool_use(AskUserQuestion) already flipped us to
-                        // AwaitingInput between TurnEnd and the scan.
-                        if s.activity != Activity::AwaitingInput {
-                            s.activity = Activity::Idle;
-                            s.subtitle = Some(tool_display::format_for_thread(s));
-                            pending_write_at = Some(now + cfg.state_write_debounce);
-                        }
+            Ok(DaemonEvent::PostStopScan { key, ts }) => {
+                if let Some(state) = threads.get_mut(&key) {
+                    if apply_post_stop_scan(state, ts) {
+                        pending_write_at = Some(now + cfg.state_write_debounce);
                     }
                 }
             }
@@ -565,7 +578,7 @@ fn handle_hook(
             .name("heed-post-stop".into())
             .spawn(move || {
                 std::thread::sleep(delay);
-                let _ = tx.send(DaemonEvent::PostStopScan { key });
+                let _ = tx.send(DaemonEvent::PostStopScan { key, ts: ev.ts });
             })
             .expect("spawn post-stop thread");
     }
@@ -907,6 +920,125 @@ mod tests {
             !owners_file.exists(),
             "no overlay write for an unowned lineage"
         );
+    }
+
+    #[test]
+    fn delayed_stop_cannot_overwrite_newer_activity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Finished."}]}}"#,
+        )
+        .unwrap();
+        // Exercise both the transcript scan and the unbound-session fallback.
+        for transcript_path in [None, Some(path.to_string_lossy().into_owned())] {
+            for cli in [Cli::Claude, Cli::Codex] {
+                let mut stop = ev(HookEventKind::TurnEnd, 1.0, cli, "a", None);
+                stop.transcript_path = transcript_path.clone();
+                let pending = apply_event(initial_state(&stop), &stop);
+                for (kind, tool) in [
+                    (HookEventKind::TurnStart, None),
+                    (HookEventKind::PreToolUse, Some("Bash")),
+                    (HookEventKind::ToolUse, Some("Bash")),
+                    (HookEventKind::PreToolUse, Some("PermissionRequest")),
+                    (HookEventKind::PreToolUse, Some("AskUserQuestion")),
+                    (HookEventKind::SessionEnd, None),
+                ] {
+                    // Hooks can share a timestamp; also check the event kind.
+                    for ts in [1.0, 2.0] {
+                        let mut state = apply_event(pending.clone(), &ev(kind, ts, cli, "a", tool));
+                        state.subtitle = Some(tool_display::format_for_thread(&state));
+                        let before = serde_json::to_value(&state).unwrap();
+                        assert!(
+                            !apply_post_stop_scan(&mut state, stop.ts),
+                            "{cli:?} {kind:?}"
+                        );
+                        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+                    }
+                }
+                let mut gone = pending;
+                gone.liveness = Liveness::Gone;
+                let before = serde_json::to_value(&gone).unwrap();
+                assert!(!apply_post_stop_scan(&mut gone, stop.ts));
+                assert_eq!(serde_json::to_value(&gone).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_stop_only_resolves_the_matching_turn_end() {
+        let dir = tempdir().unwrap();
+        for (text, expected, subtitle) in [
+            (None, Activity::Idle, "Idle"),
+            (Some("Finished."), Activity::Idle, "Idle"),
+            (Some("Continue?"), Activity::AwaitingInput, "Awaiting input"),
+        ] {
+            let transcript_path = text.map(|text| {
+                let path = dir.path().join("transcript.jsonl");
+                std::fs::write(
+                    &path,
+                    serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}).to_string(),
+                )
+                .unwrap();
+                path.to_string_lossy().into_owned()
+            });
+            let mut stop = ev(HookEventKind::TurnEnd, 1.0, Cli::Claude, "a", None);
+            stop.transcript_path = transcript_path;
+            let state = apply_event(initial_state(&stop), &stop);
+            let state = apply_event(
+                state,
+                &ev(HookEventKind::TurnStart, 2.0, Cli::Claude, "a", None),
+            );
+            let mut state = apply_event(
+                state,
+                &ev(HookEventKind::TurnEnd, 3.0, Cli::Claude, "a", None),
+            );
+            let before = serde_json::to_value(&state).unwrap();
+            assert!(!apply_post_stop_scan(&mut state, 1.0));
+            assert_eq!(serde_json::to_value(&state).unwrap(), before);
+            assert!(apply_post_stop_scan(&mut state, 3.0));
+            assert_eq!(state.activity, expected);
+            assert_eq!(state.subtitle.as_deref(), Some(subtitle));
+        }
+    }
+
+    #[test]
+    fn scheduled_stop_cannot_finish_a_resumed_turn() {
+        let dir = tempdir().unwrap();
+        let mut threads = HashMap::new();
+        let mut owners = HashMap::new();
+        let (tx, rx) = mpsc::channel();
+        let cfg = DaemonConfig {
+            post_stop_scan_delay: Duration::ZERO,
+            ..DaemonConfig::default()
+        };
+        for event in [
+            ev(HookEventKind::TurnEnd, 1.0, Cli::Codex, "a", None),
+            ev(HookEventKind::TurnStart, 2.0, Cli::Codex, "a", None),
+        ] {
+            handle_hook(
+                event,
+                &mut threads,
+                &mut owners,
+                &dir.path().join("owners.json"),
+                0.0,
+                &tx,
+                None,
+                &cfg,
+            );
+        }
+        // Explicitly deliver the queued scan after the new turn: no timing race.
+        let DaemonEvent::PostStopScan { key, ts } =
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected delayed stop scan");
+        };
+        assert_eq!(ts, 1.0);
+        let state = threads.get_mut(&key).unwrap();
+        assert!(!apply_post_stop_scan(state, ts));
+        assert_eq!(state.activity, Activity::Working);
+        assert_eq!(state.subtitle.as_deref(), Some("Working"));
     }
 
     #[test]
