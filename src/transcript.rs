@@ -22,6 +22,36 @@ const RETRY_DELAY_MS: u64 = 200;
 
 /// SPEC §4.2 / Codezilla `endsLikeQuestion`: scan the last "meaningful" chars
 /// (`[A-Za-z0-9?.!]`) and look at the last one.
+/// What Claude Code records about an agent when it launches one, from
+/// `<session transcript without .jsonl>/subagents/agent-<agent id>.meta.json`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AgentMeta {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// Path of an agent's metadata file, given its session's transcript path.
+pub fn agent_meta_path(session_transcript: &Path, agent_id: &str) -> Option<std::path::PathBuf> {
+    let stem = session_transcript.file_stem()?;
+    let dir = session_transcript.parent()?;
+    Some(
+        dir.join(stem)
+            .join("subagents")
+            .join(format!("agent-{agent_id}.meta.json")),
+    )
+}
+
+/// Read an agent's metadata file; `None` while it doesn't exist yet or can't be parsed.
+pub fn read_agent_meta(session_transcript: &Path, agent_id: &str) -> Option<AgentMeta> {
+    let path = agent_meta_path(session_transcript, agent_id)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 pub fn ends_like_question(text: &str) -> PostStopResult {
     let mut last_meaningful: Option<char> = None;
     for c in text.chars() {
@@ -182,6 +212,25 @@ pub fn scan_post_stop(transcript_path: &Path) -> PostStopResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_agent_meta_beside_the_session_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let sub = dir.path().join("sess-1").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-a1.meta.json"),
+            r#"{"agentType":"build-RS-1","description":"Build RS-1","name":"build-RS-1","color":"purple","spawnDepth":0}"#,
+        )
+        .unwrap();
+        let meta = super::read_agent_meta(&transcript, "a1").unwrap();
+        assert_eq!(meta.description.as_deref(), Some("Build RS-1"));
+        assert_eq!(meta.name.as_deref(), Some("build-RS-1"));
+        assert_eq!(meta.color.as_deref(), Some("purple"));
+        assert_eq!(super::read_agent_meta(&transcript, "missing"), None);
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

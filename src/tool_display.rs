@@ -350,6 +350,9 @@ mod tests {
             agent_id: None,
             agent_type: None,
             parent_thread_id: None,
+            agent_description: None,
+            agent_name: None,
+            agent_color: None,
             own_activity: None,
             agents_active: 0,
         };
@@ -390,6 +393,9 @@ mod tests {
             agent_id: None,
             agent_type: None,
             parent_thread_id: None,
+            agent_description: None,
+            agent_name: None,
+            agent_color: None,
             own_activity: None,
             agents_active: 0,
         };

@@ -124,6 +124,15 @@ pub struct ThreadState {
     /// Agent records only: the session (`thread_id`) the agent runs inside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
+    /// Agent records only, from Claude Code's per-agent metadata file
+    /// (`<session>/subagents/agent-<id>.meta.json`): the description the
+    /// agent was launched with, a named agent's name, and its colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_color: Option<String>,
     /// Session records, as written to state.json: the session's own state,
     /// before its agents are rolled into `activity`. In memory the daemon
     /// keeps the session's own state in `activity` and rolls up at write time.
@@ -276,6 +285,9 @@ pub fn initial_state(ev: &HookEvent) -> ThreadState {
         agent_id: None,
         agent_type: None,
         parent_thread_id: None,
+        agent_description: None,
+        agent_name: None,
+        agent_color: None,
         own_activity: None,
         agents_active: 0,
     }

@@ -519,6 +519,7 @@ fn handle_hook(
             .remove(&agent_key)
             .unwrap_or_else(|| crate::state::initial_agent_state(&ev));
         let mut next = crate::state::apply_agent_event(current, &ev);
+        fill_agent_meta(&mut next);
         next.subtitle = Some(tool_display::format_for_thread(&next));
         threads.insert(agent_key, next);
         return;
@@ -733,6 +734,25 @@ fn flush_state(threads: &HashMap<ThreadKey, ThreadState>, state_path: &Path) -> 
         by_key.insert(format!("{cli}:{tid}"), state);
     }
     state_writer::write(state_path, &state_writer::build_state_file(by_key))
+}
+
+/// Copy an agent's description, name and colour from Claude Code's metadata
+/// file onto its record. Retried on each of the agent's events until the file
+/// has been read once (it's written when the agent launches).
+fn fill_agent_meta(agent: &mut ThreadState) {
+    if agent.agent_description.is_some() || agent.agent_name.is_some() {
+        return;
+    }
+    let (Some(transcript), Some(agent_id)) =
+        (agent.transcript_path.clone(), agent.agent_id.clone())
+    else {
+        return;
+    };
+    if let Some(meta) = transcript::read_agent_meta(Path::new(&transcript), &agent_id) {
+        agent.agent_description = meta.description.filter(|s| !s.is_empty());
+        agent.agent_name = meta.name.filter(|s| !s.is_empty());
+        agent.agent_color = meta.color.filter(|s| !s.is_empty());
+    }
 }
 
 /// An agent with no hook event for this long no longer counts as working for
@@ -1377,6 +1397,33 @@ mod tests {
         assert_eq!(agent.activity, Activity::Working);
         assert!(agent.last_tool_name.is_none());
         assert_eq!(agent.subtitle.as_deref(), Some("Working"));
+    }
+
+    #[test]
+    fn an_agent_record_picks_up_its_description_name_and_colour() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let mut e = agent_ev(HookEventKind::SubagentStart, 1.0, "a1", None);
+        e.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        let mut agent = crate::state::apply_agent_event(crate::state::initial_agent_state(&e), &e);
+        // Not written yet: nothing to read, retried on the next event.
+        fill_agent_meta(&mut agent);
+        assert!(agent.agent_description.is_none());
+        let sub = dir.path().join("s").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("agent-a1.meta.json"),
+            r#"{"description":"Build RS-853 restore recipe projector","name":"build-RS-853","color":"purple"}"#,
+        )
+        .unwrap();
+        fill_agent_meta(&mut agent);
+        assert_eq!(
+            agent.agent_description.as_deref(),
+            Some("Build RS-853 restore recipe projector")
+        );
+        assert_eq!(agent.agent_name.as_deref(), Some("build-RS-853"));
+        assert_eq!(agent.agent_color.as_deref(), Some("purple"));
     }
 
     #[test]
