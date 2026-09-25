@@ -7,7 +7,8 @@
 //! 3. Load owners.json overlay.
 //! 4. Run the central reducer loop until SIGINT/SIGTERM.
 //! 5. On each Hook event: run reducer, schedule a debounced state.json write.
-//! 6. Every 30s: poll liveness for threads idle > 120s.
+//! 6. Every 30s: poll liveness for threads idle > 120s (one check per
+//!    process), and prune records nobody needs (`prune_records`).
 //! 7. After a TurnEnd: 200ms later, run transcript scan and resolve activity.
 
 pub mod log;
@@ -371,6 +372,25 @@ fn run_loop(
 
     loop {
         let now = Instant::now();
+        // A due write goes out before the next event is taken, so a steady
+        // stream of events (hooks, liveness ticks) can never starve it (HD-17).
+        if pending_write_at.is_some_and(|when| now >= when) {
+            flush_state(&threads, &paths.state_file)?;
+            persist_watcher_offset(home, watcher_offset.as_ref());
+            pending_write_at = None;
+        }
+        // Watchdog: if the event-watcher thread has died (panic, or a notify
+        // backend failure), no hook event can ever reach us again — we'd be a
+        // live-but-dead daemon. Flush, persist the offset, and exit non-zero so
+        // the launchd/systemd supervisor (KeepAlive) restarts us; the fresh
+        // daemon resumes from the persisted offset. Checked every iteration
+        // (it's one is_finished call), so a busy channel can't hide it.
+        if watcher_died(watcher_thread) {
+            error!("daemon: event watcher thread exited unexpectedly; restarting");
+            flush_state(&threads, &paths.state_file)?;
+            persist_watcher_offset(home, watcher_offset.as_ref());
+            return Err("event watcher thread exited; restart for recovery".into());
+        }
         let timeout = match pending_write_at {
             Some(t) if t > now => t.duration_since(now),
             Some(_) => Duration::from_millis(0),
@@ -398,7 +418,7 @@ fn run_loop(
                     Some(&reviewer),
                     cfg,
                 );
-                pending_write_at = Some(now + cfg.state_write_debounce);
+                schedule_write(&mut pending_write_at, now, cfg);
             }
             Ok(DaemonEvent::ReviewerScanned {
                 key,
@@ -407,7 +427,7 @@ fn run_loop(
             }) => {
                 if let Some(state) = threads.get_mut(&key) {
                     if apply_reviewer_result(state, ts, auto_review) {
-                        pending_write_at = Some(now + cfg.state_write_debounce);
+                        schedule_write(&mut pending_write_at, now, cfg);
                     }
                 }
             }
@@ -418,17 +438,19 @@ fn run_loop(
                 // and the next `heed owner register` writes a fresh file.
                 owners = owners::load_or_quarantine(&paths.owners_file);
                 apply_owners_overlay(&mut threads, &owners);
-                pending_write_at = Some(now + cfg.state_write_debounce);
+                schedule_write(&mut pending_write_at, now, cfg);
             }
             Ok(DaemonEvent::LivenessTick) => {
-                if poll_liveness(&mut threads, cfg) {
-                    pending_write_at = Some(now + cfg.state_write_debounce);
+                let polled = poll_liveness(&mut threads, cfg);
+                let pruned = prune_records(&mut threads, state_writer::now_unix());
+                if polled || pruned {
+                    schedule_write(&mut pending_write_at, now, cfg);
                 }
             }
             Ok(DaemonEvent::PostStopScan { key, ts }) => {
                 if let Some(state) = threads.get_mut(&key) {
                     if apply_post_stop_scan(state, ts) {
-                        pending_write_at = Some(now + cfg.state_write_debounce);
+                        schedule_write(&mut pending_write_at, now, cfg);
                     }
                 }
             }
@@ -439,27 +461,7 @@ fn run_loop(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Either a debounced write is due, or run_once is draining.
-                if let Some(when) = pending_write_at {
-                    if now >= when {
-                        flush_state(&threads, &paths.state_file)?;
-                        persist_watcher_offset(home, watcher_offset.as_ref());
-                        pending_write_at = None;
-                    }
-                }
-                // Watchdog: if the event-watcher thread has died (panic, or a
-                // notify backend failure), no hook event can ever reach us
-                // again — we'd be a live-but-dead daemon. Flush, persist the
-                // offset, and exit non-zero so the launchd/systemd supervisor
-                // (KeepAlive) restarts us; the fresh daemon resumes from the
-                // persisted offset. Idle timeouts (≤60s) bound the detection
-                // latency. run_once has no watcher thread, so this never fires.
-                if watcher_died(watcher_thread) {
-                    error!("daemon: event watcher thread exited unexpectedly; restarting");
-                    flush_state(&threads, &paths.state_file)?;
-                    persist_watcher_offset(home, watcher_offset.as_ref());
-                    return Err("event watcher thread exited; restart for recovery".into());
-                }
+                // A due write goes out at the top of the next iteration.
                 if cfg.run_once {
                     // Pending state at the end of run_once still flushes.
                     if pending_write_at.is_none() {
@@ -476,6 +478,14 @@ fn run_loop(
         persist_watcher_offset(home, watcher_offset.as_ref());
     }
     Ok(())
+}
+
+/// Schedule a debounced state.json write `debounce` after the FIRST change
+/// since the last write. A later change never pushes it back: with a trailing
+/// debounce, events arriving faster than the debounce would postpone the write
+/// forever (HD-17).
+fn schedule_write(pending_write_at: &mut Option<Instant>, now: Instant, cfg: &DaemonConfig) {
+    pending_write_at.get_or_insert(now + cfg.state_write_debounce);
 }
 
 /// Watchdog predicate: true when a watcher thread was spawned but has since
@@ -703,7 +713,21 @@ fn apply_owners_overlay(
 /// Poll liveness for threads whose last_event is stale. Returns true if any
 /// thread changed state.
 fn poll_liveness(threads: &mut HashMap<ThreadKey, ThreadState>, cfg: &DaemonConfig) -> bool {
+    poll_liveness_with(threads, cfg, liveness::check)
+}
+
+/// `poll_liveness` with the process check injected (tests count its calls).
+/// The check runs once per distinct (pid, pid_start) per sweep: a session's
+/// agent records all carry the session's process, so checking per record
+/// spawned a `ps` for every agent the session ever ran, and a sweep outgrew
+/// its 30s tick (HD-17).
+fn poll_liveness_with(
+    threads: &mut HashMap<ThreadKey, ThreadState>,
+    cfg: &DaemonConfig,
+    mut check: impl FnMut(u32, &str) -> LivenessCheck,
+) -> bool {
     let now_unix = state_writer::now_unix();
+    let mut checked: HashMap<(u32, String), LivenessCheck> = HashMap::new();
     let mut changed = false;
     for state in threads.values_mut() {
         if state.liveness == Liveness::Gone {
@@ -713,7 +737,9 @@ fn poll_liveness(threads: &mut HashMap<ThreadKey, ThreadState>, cfg: &DaemonConf
         if event_age < cfg.liveness_event_grace {
             continue;
         }
-        let result = liveness::check(state.pid, &state.pid_start);
+        let result = *checked
+            .entry((state.pid, state.pid_start.clone()))
+            .or_insert_with(|| check(state.pid, &state.pid_start));
         state.last_check = now_unix;
         if matches!(result, LivenessCheck::Gone) && state.liveness != Liveness::Gone {
             state.liveness = Liveness::Gone;
@@ -724,6 +750,66 @@ fn poll_liveness(threads: &mut HashMap<ThreadKey, ThreadState>, cfg: &DaemonConf
         }
     }
     changed
+}
+
+/// Finished agent records kept per session; older ones are pruned (HD-17).
+/// Matches what Codezilla keeps per thread, which holds its own copy.
+pub const FINISHED_AGENTS_KEPT: usize = 50;
+/// A gone record (session or agent) is pruned this long after its last event.
+pub const GONE_RETAIN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// An agent record that carries nothing: finished, with no type, name or
+/// description, and one event only (a lone stop). Claude Code emits a stream
+/// of these; kept, they grew a long session to hundreds of records (HD-17).
+fn is_ghost_agent(s: &ThreadState) -> bool {
+    s.kind == NodeKind::Subagent
+        && s.activity == Activity::Idle
+        && s.agent_type.is_none()
+        && s.agent_name.is_none()
+        && s.agent_description.is_none()
+        && s.first_seen == s.last_event
+}
+
+/// Drop records nobody needs, so the set stays bounded while sessions run for
+/// days (HD-17): ghost agents at once, a session's finished agents beyond the
+/// newest FINISHED_AGENTS_KEPT (by last event), and gone records GONE_RETAIN
+/// after their last event. A finished agent is an idle one, or one silent for
+/// AGENT_STALE_AFTER (it no longer counts in the roll-up either). Working and
+/// asking agents and live sessions are never pruned. Returns true if any
+/// record was dropped.
+pub fn prune_records(threads: &mut HashMap<ThreadKey, ThreadState>, now_unix: f64) -> bool {
+    let before = threads.len();
+    let gone_cutoff = now_unix - GONE_RETAIN.as_secs_f64();
+    let expired = |s: &ThreadState| s.liveness == Liveness::Gone && s.last_event < gone_cutoff;
+    threads.retain(|_, s| !(is_ghost_agent(s) || expired(s)));
+
+    let stale = AGENT_STALE_AFTER.as_secs_f64();
+    let mut finished: HashMap<(Cli, String), Vec<(f64, ThreadKey)>> = HashMap::new();
+    for (key, s) in threads.iter() {
+        if s.kind != NodeKind::Subagent {
+            continue;
+        }
+        let Some(parent) = s.parent_thread_id.clone() else {
+            continue;
+        };
+        if s.activity == Activity::Idle || now_unix - s.last_event >= stale {
+            finished
+                .entry((key.0, parent))
+                .or_default()
+                .push((s.last_event, key.clone()));
+        }
+    }
+    for (_, mut list) in finished {
+        if list.len() <= FINISHED_AGENTS_KEPT {
+            continue;
+        }
+        // Newest first; ties by key so the choice is stable.
+        list.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1 .1.cmp(&b.1 .1)));
+        for (_, key) in list.into_iter().skip(FINISHED_AGENTS_KEPT) {
+            threads.remove(&key);
+        }
+    }
+    threads.len() != before
 }
 
 fn flush_state(threads: &HashMap<ThreadKey, ThreadState>, state_path: &Path) -> Result<(), String> {
@@ -1629,6 +1715,241 @@ mod tests {
 
         drop(keepalive_tx);
         let _ = running.join();
+    }
+
+    // ---- HD-17: bounded sweeps, records and writes ----------------------------
+
+    /// A session "s" with `n` agent records, all on the session's process.
+    fn session_with_agents(n: usize, pid: u32) -> HashMap<ThreadKey, ThreadState> {
+        let mut threads = HashMap::new();
+        let mut s = initial_state(&ev(HookEventKind::TurnStart, 0.0, Cli::Claude, "s", None));
+        s.pid = pid;
+        s.pid_start = "Thu Sep 24 23:06:35 2026".into();
+        threads.insert(session_key(), s);
+        for i in 0..n {
+            let e = agent_ev(
+                HookEventKind::SubagentStop,
+                i as f64,
+                &format!("a{i}"),
+                None,
+            );
+            let mut a = crate::state::apply_agent_event(crate::state::initial_agent_state(&e), &e);
+            a.pid = pid;
+            a.pid_start = "Thu Sep 24 23:06:35 2026".into();
+            threads.insert(agent_key(&format!("a{i}")), a);
+        }
+        threads
+    }
+
+    #[test]
+    fn liveness_checks_each_process_once_not_each_record() {
+        let mut threads = session_with_agents(500, 4242);
+        let mut other = initial_state(&ev(HookEventKind::TurnStart, 0.0, Cli::Claude, "t", None));
+        other.pid = 4343;
+        threads.insert((Cli::Claude, "t".into()), other);
+        let cfg = DaemonConfig {
+            liveness_event_grace: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut calls = Vec::new();
+        let changed = poll_liveness_with(&mut threads, &cfg, |pid, _| {
+            calls.push(pid);
+            if pid == 4242 {
+                LivenessCheck::Gone
+            } else {
+                LivenessCheck::Live
+            }
+        });
+        calls.sort();
+        assert_eq!(calls, vec![4242, 4343]);
+        assert!(changed);
+        // The one verdict applies to every record on that process.
+        assert!(threads
+            .iter()
+            .filter(|(k, _)| k.1 != "t")
+            .all(|(_, s)| s.liveness == Liveness::Gone));
+        assert_eq!(threads[&(Cli::Claude, "t".into())].liveness, Liveness::Live);
+    }
+
+    #[test]
+    fn prune_drops_ghost_agents_but_keeps_ones_that_carry_something() {
+        let now = 1_000.0;
+        let mut threads = HashMap::new();
+        // Ghost: a lone stop with no type, name or description.
+        let mut stop = agent_ev(HookEventKind::SubagentStop, 10.0, "ghost", None);
+        stop.agent_type = None;
+        threads.insert(
+            agent_key("ghost"),
+            crate::state::apply_agent_event(crate::state::initial_agent_state(&stop), &stop),
+        );
+        // Same lone stop, but typed: kept.
+        let typed = agent_ev(HookEventKind::SubagentStop, 10.0, "typed", None);
+        threads.insert(
+            agent_key("typed"),
+            crate::state::apply_agent_event(crate::state::initial_agent_state(&typed), &typed),
+        );
+        // Untyped but working (its first event a tool call): kept.
+        let mut tool = agent_ev(HookEventKind::PreToolUse, 10.0, "busy", Some("Bash"));
+        tool.agent_type = None;
+        threads.insert(
+            agent_key("busy"),
+            crate::state::apply_agent_event(crate::state::initial_agent_state(&tool), &tool),
+        );
+        assert!(prune_records(&mut threads, now));
+        assert!(!threads.contains_key(&agent_key("ghost")));
+        assert!(threads.contains_key(&agent_key("typed")));
+        assert!(threads.contains_key(&agent_key("busy")));
+        assert!(!prune_records(&mut threads, now), "nothing more to drop");
+    }
+
+    #[test]
+    fn prune_keeps_a_live_sessions_newest_finished_agents_and_every_working_one() {
+        let now = 10_000.0;
+        let mut threads = session_with_agents(FINISHED_AGENTS_KEPT + 20, 4242);
+        // Give them types so they aren't ghosts; a{i} finished at ts i.
+        for s in threads.values_mut() {
+            if s.kind == NodeKind::Subagent {
+                s.agent_type = Some("general-purpose".into());
+                s.last_event = now - 100.0 + s.first_seen;
+            }
+        }
+        // A working agent older than every finished one: never pruned.
+        let start = agent_ev(HookEventKind::SubagentStart, now - 200.0, "worker", None);
+        threads.insert(
+            agent_key("worker"),
+            crate::state::apply_agent_event(crate::state::initial_agent_state(&start), &start),
+        );
+        assert!(prune_records(&mut threads, now));
+        assert!(threads.contains_key(&session_key()));
+        assert!(threads.contains_key(&agent_key("worker")));
+        let kept: Vec<usize> = (0..FINISHED_AGENTS_KEPT + 20)
+            .filter(|i| threads.contains_key(&agent_key(&format!("a{i}"))))
+            .collect();
+        assert_eq!(kept, (20..FINISHED_AGENTS_KEPT + 20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn prune_counts_a_long_silent_agent_as_finished() {
+        let now = 100_000.0;
+        let mut threads = session_with_agents(0, 4242);
+        for i in 0..=FINISHED_AGENTS_KEPT {
+            let e = agent_ev(
+                HookEventKind::SubagentStop,
+                now - 10.0 + i as f64 / 100.0,
+                &format!("a{i}"),
+                None,
+            );
+            threads.insert(
+                agent_key(&format!("a{i}")),
+                crate::state::apply_agent_event(crate::state::initial_agent_state(&e), &e),
+            );
+        }
+        // Its stop never arrived; silent past AGENT_STALE_AFTER, so the oldest.
+        let start = agent_ev(
+            HookEventKind::SubagentStart,
+            now - AGENT_STALE_AFTER.as_secs_f64() - 1.0,
+            "lost",
+            None,
+        );
+        threads.insert(
+            agent_key("lost"),
+            crate::state::apply_agent_event(crate::state::initial_agent_state(&start), &start),
+        );
+        prune_records(&mut threads, now);
+        assert!(!threads.contains_key(&agent_key("lost")));
+        assert!(!threads.contains_key(&agent_key("a0")));
+        assert!(threads.contains_key(&agent_key("a1")));
+    }
+
+    #[test]
+    fn prune_drops_gone_records_a_day_after_their_last_event() {
+        let now = 1_000_000.0;
+        let day = GONE_RETAIN.as_secs_f64();
+        let mut threads = HashMap::new();
+        for (id, age, gone) in [
+            ("old", day + 1.0, true),
+            ("recent", day - 1.0, true),
+            ("live", day * 3.0, false),
+        ] {
+            let mut s = initial_state(&ev(
+                HookEventKind::TurnStart,
+                now - age,
+                Cli::Claude,
+                id,
+                None,
+            ));
+            s.activity = Activity::Idle;
+            if gone {
+                s.liveness = Liveness::Gone;
+            }
+            threads.insert((Cli::Claude, id.into()), s);
+        }
+        assert!(prune_records(&mut threads, now));
+        assert!(!threads.contains_key(&(Cli::Claude, "old".into())));
+        assert!(threads.contains_key(&(Cli::Claude, "recent".into())));
+        assert!(threads.contains_key(&(Cli::Claude, "live".into())));
+    }
+
+    #[test]
+    fn a_later_change_never_pushes_a_scheduled_write_back() {
+        let cfg = DaemonConfig::default();
+        let t0 = Instant::now();
+        let mut pending = None;
+        schedule_write(&mut pending, t0, &cfg);
+        schedule_write(&mut pending, t0 + Duration::from_millis(50), &cfg);
+        assert_eq!(pending, Some(t0 + cfg.state_write_debounce));
+    }
+
+    #[test]
+    fn state_is_written_while_events_keep_arriving() {
+        // A steady stream, each event closer than the debounce: state.json
+        // must still be written mid-stream, not only once it goes quiet.
+        let tmp = tempdir().unwrap();
+        let state_file = tmp.path().join("state.json");
+        let paths = DaemonPaths {
+            event_log: tmp.path().join("events.jsonl"),
+            state_file: state_file.clone(),
+            owners_file: tmp.path().join("owners.json"),
+        };
+        let cfg = DaemonConfig {
+            state_write_debounce: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel::<DaemonEvent>();
+        let feeder_tx = tx.clone();
+        let feeder_state = state_file.clone();
+        let feeder = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut written = false;
+            let mut i = 0u32;
+            while t0.elapsed() < Duration::from_secs(3) {
+                let e = ev(
+                    HookEventKind::PreToolUse,
+                    f64::from(i),
+                    Cli::Claude,
+                    "streamed",
+                    Some("Bash"),
+                );
+                feeder_tx.send(DaemonEvent::Hook(Box::new(e))).unwrap();
+                i += 1;
+                std::thread::sleep(Duration::from_millis(5));
+                if t0.elapsed() > Duration::from_millis(300) {
+                    if let Ok(raw) = std::fs::read_to_string(&feeder_state) {
+                        if raw.contains("streamed") {
+                            written = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            feeder_tx.send(DaemonEvent::Shutdown).unwrap();
+            written
+        });
+        run_loop(tx, rx, &paths, &cfg, None, None, None).unwrap();
+        assert!(
+            feeder.join().unwrap(),
+            "state.json was not written while events streamed"
+        );
     }
 
     #[test]
