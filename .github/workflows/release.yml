@@ -139,6 +139,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -151,5 +152,5 @@ jobs:
             artifacts/heed-*.tar.gz.sha256
             artifacts/Heed-*.app.zip
             artifacts/Heed-*.app.zip.sha256
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true

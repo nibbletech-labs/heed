@@ -78,6 +78,19 @@ hooks/*.sh  →  ~/.heed/events.jsonl  →  heedd (daemon)  →  ~/.heed/state.j
                                   ~/.heed/owners.json (overlay)
 ```
 
+Codex child agents are also read from local rollout files under `$CODEX_HOME/sessions`
+(default `~/.codex/sessions`). A background reader discovers new children every five
+seconds and tails their activity every second. Explicit parent IDs attach them to
+known sessions, including nested agents; their task paths, running/finished state,
+recorded commands, and successful file changes use the same `subagent` records as
+Claude. Existing rollouts are replayed when monitoring starts. Prompt text may be
+encrypted and is not used for descriptions or ticket matching. Tool visibility
+follows what Codex records; shell writes are commands, not inferred file edits.
+
+For Codezilla's Haven grouping, use task names such as `rs1343_build_devices`.
+Worktree activity also supplies ticket refs; agents without a match remain visible
+without a ticket group. No Codex settings or hook changes are needed for this reader.
+
 `owners.json` is an optional metadata file consumers can write to tag threads with their own product/session ids (so an orchestrator can filter `state.json` down to its own children). The `heed owner register` CLI (or writing `owners.json` directly) sets it.
 
 ## Limits

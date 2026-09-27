@@ -3,6 +3,7 @@
 //! See the README for an overview; `~/.heed/state.json` is the consumption contract.
 
 pub mod cli_detect;
+pub mod codex_agents;
 pub mod codex_binder;
 pub mod commands;
 pub mod daemon;

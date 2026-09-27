@@ -103,6 +103,7 @@ pub enum DaemonEvent {
         ts: f64,
         auto_review: bool,
     },
+    CodexAgentsScanned(Vec<ThreadState>),
     /// SIGINT / SIGTERM received.
     Shutdown,
 }
@@ -136,6 +137,114 @@ fn reviewer_worker(results: Sender<DaemonEvent>) -> Sender<ReviewerRequest> {
         })
         .expect("spawn reviewer worker");
     tx
+}
+
+/// One bounded mailbox: slow disk scans cannot build up a queue of old roots.
+fn codex_agents_worker(
+    home: &Path,
+    results: Sender<DaemonEvent>,
+) -> mpsc::SyncSender<Vec<ThreadState>> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<ThreadState>>(1);
+    let root = crate::codex_binder::codex_sessions_root(home);
+    std::thread::Builder::new()
+        .name("heed-codex-agents".into())
+        .spawn(move || {
+            let mut scanner = crate::codex_agents::Scanner::new(root);
+            for roots in rx {
+                let updates = scanner.scan(&roots);
+                if !updates.is_empty()
+                    && results
+                        .send(DaemonEvent::CodexAgentsScanned(updates))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("spawn Codex agent worker");
+    tx
+}
+
+fn apply_codex_agents(
+    threads: &mut HashMap<ThreadKey, ThreadState>,
+    agents: Vec<ThreadState>,
+) -> bool {
+    let mut changed = false;
+    for mut agent in agents {
+        if threads
+            .get(&(Cli::Codex, agent.thread_id.clone()))
+            .is_some_and(|s| s.last_event > agent.last_event)
+        {
+            continue; // A newer hook already superseded this disk snapshot.
+        }
+        let Some(parent) = agent
+            .parent_thread_id
+            .as_ref()
+            .and_then(|id| threads.get(&(Cli::Codex, id.clone())))
+        else {
+            continue;
+        };
+        // The process may have died while the worker was reading its rollout.
+        agent.pid = parent.pid;
+        agent.pid_start = parent.pid_start.clone();
+        if parent.liveness == Liveness::Gone {
+            agent.liveness = Liveness::Gone;
+            agent.activity = Activity::Idle;
+        }
+        // Some Codex versions emit child hooks as independent sessions. Once
+        // an explicit parent link exists, keep just the agent representation.
+        if let Some(id) = agent.agent_id.as_ref() {
+            let key = (Cli::Codex, id.clone());
+            if threads.get(&key).is_some_and(|s| s.owner_product.is_none()) {
+                threads.remove(&key);
+            }
+        }
+        agent.subtitle = Some(tool_display::format_for_thread(&agent));
+        threads.insert((Cli::Codex, agent.thread_id.clone()), agent);
+        changed = true;
+    }
+    changed
+}
+
+/// A root waiting for its children may emit no new hook after a daemon
+/// restart. Recover live Codex roots so the rollout reader can resume now.
+/// Agent records are reconstructed from rollouts, not trusted from disk.
+fn restore_codex_roots(
+    path: &Path,
+    mut check: impl FnMut(u32, &str) -> LivenessCheck,
+) -> HashMap<ThreadKey, ThreadState> {
+    let mut roots = HashMap::new();
+    let Some(raw) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return roots;
+    };
+    if raw["schema_version"] != state_writer::SCHEMA_VERSION {
+        return roots;
+    }
+    let Some(records) = raw["threads"].as_object() else {
+        return roots;
+    };
+    for value in records.values() {
+        let Ok(mut state) = serde_json::from_value::<ThreadState>(value.clone()) else {
+            continue;
+        };
+        if state.cli != Cli::Codex
+            || state.kind != NodeKind::Session
+            || state.liveness != Liveness::Live
+            || state.pid_start.is_empty()
+            || check(state.pid, &state.pid_start) != LivenessCheck::Live
+        {
+            continue;
+        }
+        state.activity = state.own_activity.take().unwrap_or(state.activity);
+        state.agents_active = 0;
+        state.owner_product = None;
+        state.owner_thread_id = None;
+        roots.insert((Cli::Codex, state.thread_id.clone()), state);
+    }
+    roots
 }
 
 fn apply_reviewer_result(state: &mut ThreadState, ts: f64, auto_review: bool) -> bool {
@@ -355,23 +464,44 @@ fn run_loop(
     home: Option<&Path>,
     watcher_thread: Option<&JoinHandle<()>>,
 ) -> Result<(), String> {
-    let mut threads: HashMap<ThreadKey, ThreadState> = HashMap::new();
+    let mut threads = if cfg.run_once {
+        HashMap::new()
+    } else {
+        restore_codex_roots(&paths.state_file, liveness::check)
+    };
     let mut owners = owners::load_or_quarantine(&paths.owners_file);
     // Used to age out succession decisions that rest on a thread's *absence*
     // from `threads`, which is meaningless in the first moments after startup.
     let started_at = state_writer::now_unix();
 
-    // Apply initial owners overlay over an empty map (no-op, but consistent).
+    // Restore current ownership over any recovered live Codex roots.
     apply_owners_overlay(&mut threads, &owners);
 
     // Initial write so consumers can poll state.json immediately.
     flush_state(&threads, &paths.state_file)?;
 
     let reviewer = reviewer_worker(self_tx.clone());
+    let codex_agents = if cfg.run_once {
+        None
+    } else {
+        home.map(|home| codex_agents_worker(home, self_tx.clone()))
+    };
+    let mut next_agent_scan = Instant::now();
     let mut pending_write_at: Option<Instant> = None;
 
     loop {
         let now = Instant::now();
+        if now >= next_agent_scan {
+            if let Some(worker) = &codex_agents {
+                let roots = threads
+                    .values()
+                    .filter(|s| s.cli == Cli::Codex && s.kind == NodeKind::Session)
+                    .cloned()
+                    .collect();
+                let _ = worker.try_send(roots);
+            }
+            next_agent_scan = now + Duration::from_secs(1);
+        }
         // A due write goes out before the next event is taken, so a steady
         // stream of events (hooks, liveness ticks) can never starve it (HD-17).
         if pending_write_at.is_some_and(|when| now >= when) {
@@ -395,7 +525,8 @@ fn run_loop(
             Some(t) if t > now => t.duration_since(now),
             Some(_) => Duration::from_millis(0),
             None => Duration::from_secs(60),
-        };
+        }
+        .min(Duration::from_secs(1));
 
         let recv_result = if cfg.run_once {
             rx.try_recv().map_err(|e| match e {
@@ -429,6 +560,11 @@ fn run_loop(
                     if apply_reviewer_result(state, ts, auto_review) {
                         schedule_write(&mut pending_write_at, now, cfg);
                     }
+                }
+            }
+            Ok(DaemonEvent::CodexAgentsScanned(agents)) => {
+                if apply_codex_agents(&mut threads, agents) {
+                    schedule_write(&mut pending_write_at, now, cfg);
                 }
             }
             Ok(DaemonEvent::OwnersChanged) => {
@@ -511,7 +647,7 @@ fn persist_watcher_offset(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_hook(
-    ev: HookEvent,
+    mut ev: HookEvent,
     threads: &mut HashMap<ThreadKey, ThreadState>,
     owners: &mut HashMap<ThreadKey, owners::OwnerRecord>,
     owners_file: &Path,
@@ -520,6 +656,22 @@ fn handle_hook(
     reviewer: Option<&Sender<ReviewerRequest>>,
     cfg: &DaemonConfig,
 ) {
+    if ev.cli == Cli::Codex && ev.agent_id().is_none() {
+        if let Some(agent) = threads.values().find(|s| {
+            s.cli == Cli::Codex
+                && s.kind == NodeKind::Subagent
+                && s.agent_id.as_deref() == Some(&ev.thread_id)
+        }) {
+            if let Some(parent) = &agent.parent_thread_id {
+                ev.agent_id = Some(ev.thread_id.clone());
+                ev.thread_id = parent.clone();
+                // Child hooks may carry a short-lived helper's pid. The root
+                // process is the lifetime of these in-process Codex agents.
+                ev.pid = agent.pid;
+                ev.pid_start = agent.pid_start.clone();
+            }
+        }
+    }
     // An event from an agent inside a session goes to the agent's own record
     // and nowhere else: it must not touch the session's state, last_event or
     // recent events (HD-15), and agents take no part in succession, owner
@@ -528,6 +680,10 @@ fn handle_hook(
         let current = threads
             .remove(&agent_key)
             .unwrap_or_else(|| crate::state::initial_agent_state(&ev));
+        if current.last_event > ev.ts {
+            threads.insert(agent_key, current);
+            return;
+        }
         let mut next = crate::state::apply_agent_event(current, &ev);
         fill_agent_meta(&mut next);
         next.subtitle = Some(tool_display::format_for_thread(&next));
@@ -539,6 +695,10 @@ fn handle_hook(
 
     let known = threads.contains_key(&key);
     let current = threads.remove(&key).unwrap_or_else(|| initial_state(&ev));
+    if current.last_event > ev.ts {
+        threads.insert(key, current);
+        return;
+    }
     let mut next = apply_event(current, &ev);
 
     // Hold the working state while a background lookup distinguishes an
@@ -1970,5 +2130,174 @@ mod tests {
         let changed = poll_liveness(&mut threads, &cfg);
         assert!(changed);
         assert_eq!(threads[&(Cli::Claude, "a".into())].liveness, Liveness::Gone);
+    }
+    #[test]
+    fn codex_scan_rolls_up_without_changing_own_activity_or_stealing_ownership() {
+        let mut parent = initial_state(&ev(HookEventKind::TurnEnd, 10.0, Cli::Codex, "root", None));
+        parent.activity = Activity::Idle;
+        parent.owner_product = Some("codezilla".into());
+        parent.owner_thread_id = Some("ux".into());
+        let mut child_event = ev(HookEventKind::SubagentStart, 11.0, Cli::Codex, "root", None);
+        child_event.agent_id = Some("child".into());
+        let child = crate::state::initial_agent_state(&child_event);
+        let child_session = initial_state(&ev(
+            HookEventKind::TurnStart,
+            11.0,
+            Cli::Codex,
+            "child",
+            None,
+        ));
+        let key = (Cli::Codex, "root".into());
+        let mut threads = HashMap::from([
+            (key.clone(), parent),
+            ((Cli::Codex, "child".into()), child_session),
+        ]);
+        assert!(apply_codex_agents(&mut threads, vec![child.clone()]));
+        assert!(!threads.contains_key(&(Cli::Codex, "child".into())));
+        let rolled = roll_up_agents(&threads, 12.0);
+        assert_eq!(rolled[&key].activity, Activity::Working);
+        assert_eq!(rolled[&key].own_activity, Some(Activity::Idle));
+        assert_eq!(rolled[&key].agents_active, 1);
+        assert_eq!(rolled[&key].owner_thread_id.as_deref(), Some("ux"));
+        assert_eq!(threads[&key].last_event, 10.0);
+        // A delayed scanner result cannot revive children of a dead root.
+        threads.get_mut(&key).unwrap().liveness = Liveness::Gone;
+        apply_codex_agents(&mut threads, vec![child]);
+        assert_eq!(
+            threads[&(Cli::Codex, "root:child".into())].liveness,
+            Liveness::Gone
+        );
+    }
+
+    #[test]
+    fn codex_child_hooks_route_to_agent_and_newer_hooks_beat_delayed_scans() {
+        let dir = tempdir().unwrap();
+        let parent = initial_state(&ev(
+            HookEventKind::TurnStart,
+            10.0,
+            Cli::Codex,
+            "root",
+            None,
+        ));
+        let mut e = ev(HookEventKind::SubagentStart, 11.0, Cli::Codex, "root", None);
+        e.agent_id = Some("child".into());
+        let child = crate::state::initial_agent_state(&e);
+        let mut threads = HashMap::from([((Cli::Codex, "root".into()), parent)]);
+        apply_codex_agents(&mut threads, vec![child.clone()]);
+        let (tx, _rx) = mpsc::channel();
+        handle_hook(
+            ev(HookEventKind::TurnEnd, 20.0, Cli::Codex, "child", None),
+            &mut threads,
+            &mut HashMap::new(),
+            &dir.path().join("owners.json"),
+            0.0,
+            &tx,
+            None,
+            &DaemonConfig::default(),
+        );
+        assert!(!threads.contains_key(&(Cli::Codex, "child".into())));
+        assert_eq!(
+            threads[&(Cli::Codex, "root:child".into())].activity,
+            Activity::Idle
+        );
+        assert!(!apply_codex_agents(&mut threads, vec![child]));
+        assert_eq!(threads[&(Cli::Codex, "root:child".into())].last_event, 20.0);
+        assert_eq!(threads[&(Cli::Codex, "root".into())].last_event, 10.0);
+    }
+
+    #[test]
+    fn codex_worker_updates_state_without_needing_another_parent_hook() {
+        let home = tempdir().unwrap();
+        let heed_dir = home.path().join(".heed");
+        let sessions = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&heed_dir).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout-child.jsonl"), concat!(
+            "{\"timestamp\":\"2026-09-27T13:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"cwd\":\"/repo\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"agent_path\":\"/root/rs1343_build\"}}}}}\n",
+            "{\"timestamp\":\"2026-09-27T13:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+        )).unwrap();
+        let paths = DaemonPaths {
+            event_log: heed_dir.join("events.jsonl"),
+            state_file: heed_dir.join("state.json"),
+            owners_file: heed_dir.join("owners.json"),
+        };
+        let state_file = paths.state_file.clone();
+        let home_path = home.path().to_owned();
+        let (tx, rx) = mpsc::channel();
+        let thread_tx = tx.clone();
+        tx.send(DaemonEvent::Hook(Box::new(ev(
+            HookEventKind::TurnStart,
+            1.0,
+            Cli::Codex,
+            "root",
+            None,
+        ))))
+        .unwrap();
+        let handle = std::thread::spawn(move || {
+            run_loop(
+                thread_tx,
+                rx,
+                &paths,
+                &DaemonConfig::default(),
+                None,
+                Some(&home_path),
+                None,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut found = false;
+        while Instant::now() < deadline {
+            if let Ok(raw) = std::fs::read_to_string(&state_file) {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if v["threads"]["codex:root:child"]["agent_name"] == "/root/rs1343_build" {
+                    found = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        tx.send(DaemonEvent::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+        assert!(found, "background worker never published the child agent");
+    }
+    #[test]
+    fn restart_recovers_only_live_codex_roots_and_restores_their_own_activity() {
+        let dir = tempdir().unwrap();
+        let mut root = initial_state(&ev(HookEventKind::TurnStart, 1.0, Cli::Codex, "root", None));
+        root.own_activity = Some(Activity::Idle);
+        root.agents_active = 3;
+        root.owner_product = Some("stale-overlay".into());
+        let mut dead = root.clone();
+        dead.thread_id = "dead".into();
+        dead.pid = 999;
+        let mut claude = root.clone();
+        claude.cli = Cli::Claude;
+        let mut child = root.clone();
+        child.kind = NodeKind::Subagent;
+        let file = state_writer::build_state_file(HashMap::from([
+            ("codex:root".into(), root),
+            ("codex:dead".into(), dead),
+            ("claude:root".into(), claude),
+            ("codex:child".into(), child),
+        ]));
+        let path = dir.path().join("state.json");
+        state_writer::write(&path, &file).unwrap();
+        let restored = restore_codex_roots(&path, |pid, _| {
+            if pid == 999 {
+                LivenessCheck::Gone
+            } else {
+                LivenessCheck::Live
+            }
+        });
+        assert_eq!(restored.len(), 1);
+        let root = &restored[&(Cli::Codex, "root".into())];
+        assert_eq!(root.activity, Activity::Idle);
+        assert_eq!(root.agents_active, 0);
+        assert!(root.owner_product.is_none());
+        assert!(root.own_activity.is_none());
+        std::fs::write(&path, "corrupt").unwrap();
+        assert!(
+            restore_codex_roots(&path, |_, _| panic!("must not check corrupt data")).is_empty()
+        );
     }
 }
