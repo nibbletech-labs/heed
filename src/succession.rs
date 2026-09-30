@@ -14,7 +14,8 @@
 //! 1. **Same process, new session id.** Every hook event carries the CLI's pid
 //!    and that process's start time. A new session reporting a `(pid,
 //!    pid_start)` pair that already belongs to a tracked thread *is* that
-//!    thread, continued in-process.
+//!    thread, continued in-process — unless that process is a shared session
+//!    host (Codex's `app-server` daemon), where every session shares one pid.
 //! 2. **`--resume <parent>` in the successor's argv.** A forked session names
 //!    the transcript it continues; the file stem is the predecessor's session
 //!    UUID. `claude --resume <uuid>` (no path) is accepted in the same way.
@@ -53,7 +54,56 @@ pub fn resolve_predecessor<T>(
     threads: &HashMap<ThreadKey, ThreadState>,
     owned: &HashMap<ThreadKey, T>,
 ) -> Option<ThreadKey> {
-    same_process_predecessor(ev, threads).or_else(|| resumed_predecessor(ev, threads, owned))
+    predecessor_given_argv(ev, process_argv(ev.pid).as_deref(), threads, owned)
+}
+
+/// [`resolve_predecessor`] with the hook process's argv already read.
+fn predecessor_given_argv<T>(
+    ev: &HookEvent,
+    argv: Option<&str>,
+    threads: &HashMap<ThreadKey, ThreadState>,
+    owned: &HashMap<ThreadKey, T>,
+) -> Option<ThreadKey> {
+    let same_process = if pid_identifies_session(ev.cli, argv) {
+        same_process_predecessor(ev, threads)
+    } else {
+        None
+    };
+    same_process.or_else(|| resumed_predecessor(ev, argv?, threads, owned))
+}
+
+/// A failed process lookup is not evidence that a Codex host is dedicated to
+/// one session. Claude's in-process rotation remains usable without argv.
+fn pid_identifies_session(cli: crate::state::Cli, argv: Option<&str>) -> bool {
+    !argv.is_some_and(is_shared_session_host) && (cli != crate::state::Cli::Codex || argv.is_some())
+}
+
+/// An older daemon may have persisted false succession links between Codex
+/// sessions on one shared host. Keeping those links would still transfer
+/// ownership on the next hook even after new linking has been fixed.
+pub(crate) fn discard_untrusted_restored_links(state: &mut ThreadState) {
+    discard_links_given_argv(state, process_argv(state.pid).as_deref());
+}
+
+fn discard_links_given_argv(state: &mut ThreadState, argv: Option<&str>) {
+    if state.cli == crate::state::Cli::Codex && !pid_identifies_session(state.cli, argv) {
+        state.supersedes = None;
+        state.superseded_by = None;
+    }
+}
+
+/// Whether `argv` is a process that hosts many independent sessions at once,
+/// so sharing it says nothing about one session continuing another. Codex
+/// runs every session — each terminal's, and every agent's — inside one
+/// long-lived `codex app-server` daemon, and its hooks report that daemon as
+/// their process.
+fn is_shared_session_host(argv: &str) -> bool {
+    let mut tokens = argv.split_whitespace();
+    let is_codex = tokens
+        .next()
+        .and_then(|exe| exe.rsplit('/').next())
+        .is_some_and(|name| name == "codex");
+    is_codex && tokens.any(|t| t == "app-server")
 }
 
 /// A tracked thread on the same process instance — the session was rotated
@@ -86,11 +136,11 @@ fn same_process_predecessor(
 /// A thread named by `--resume` in the successor's argv.
 fn resumed_predecessor<T>(
     ev: &HookEvent,
+    argv: &str,
     threads: &HashMap<ThreadKey, ThreadState>,
     owned: &HashMap<ThreadKey, T>,
 ) -> Option<ThreadKey> {
-    let argv = process_argv(ev.pid)?;
-    let parent = parse_resumed_session_id(&argv)?;
+    let parent = parse_resumed_session_id(argv)?;
     if parent == ev.thread_id {
         return None;
     }
@@ -243,6 +293,7 @@ mod tests {
 
     const UUID_A: &str = "c7df16c4-a60a-4f11-a3ec-3afd5e15aaed";
     const UUID_B: &str = "e033bfc1-a5dc-4fa4-806b-4040d1e9716f";
+    const UUID_C: &str = "b43f485a-468e-4d85-b6a6-9e1fe415f003";
 
     #[test]
     fn parses_resume_transcript_path() {
@@ -306,6 +357,121 @@ mod tests {
         threads.insert((Cli::Claude, UUID_A.to_string()), spent);
         let ev = event(UUID_B, 13483, "start");
         assert_eq!(resolve_predecessor(&ev, &threads, &no_owners()), None);
+    }
+
+    const APP_SERVER: &str = "/Users/t/.codex/packages/app-server-daemon/releases/0.158.0-aarch64-apple-darwin/bin/codex app-server --listen unix:// --managed-daemon";
+
+    fn codex_threads_on(pid: u32, pid_start: &str) -> HashMap<ThreadKey, ThreadState> {
+        let mut a = thread(UUID_A, pid, pid_start);
+        a.cli = Cli::Codex;
+        HashMap::from([((Cli::Codex, UUID_A.to_string()), a)])
+    }
+
+    fn codex_event(id: &str, pid: u32, pid_start: &str) -> HookEvent {
+        HookEvent {
+            cli: Cli::Codex,
+            ..event(id, pid, pid_start)
+        }
+    }
+
+    #[test]
+    fn sessions_sharing_the_codex_app_server_are_not_successors() {
+        let threads = codex_threads_on(50509, "Mon Sep 28 07:14:55 2026");
+        let ev = codex_event(UUID_B, 50509, "Mon Sep 28 07:14:55 2026");
+        assert_eq!(
+            predecessor_given_argv(&ev, Some(APP_SERVER), &threads, &no_owners()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shared_codex_host_does_not_link_to_an_owned_session() {
+        let threads = codex_threads_on(50509, "start");
+        let owned = HashMap::from([((Cli::Codex, UUID_A.to_string()), ())]);
+        let ev = codex_event(UUID_B, 50509, "start");
+        assert_eq!(
+            predecessor_given_argv(&ev, Some(APP_SERVER), &threads, &owned),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_codex_host_does_not_link_sessions_by_pid() {
+        let threads = codex_threads_on(50509, "start");
+        let ev = codex_event(UUID_B, 50509, "start");
+        assert_eq!(
+            predecessor_given_argv(&ev, None, &threads, &no_owners()),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_claude_process_still_links_in_process_rotation() {
+        let threads = HashMap::from([(
+            (Cli::Claude, UUID_A.to_string()),
+            thread(UUID_A, 4242, "start"),
+        )]);
+        assert_eq!(
+            predecessor_given_argv(&event(UUID_B, 4242, "start"), None, &threads, &no_owners()),
+            Some((Cli::Claude, UUID_A.to_string()))
+        );
+    }
+
+    #[test]
+    fn discards_persisted_shared_host_links_in_both_directions() {
+        let mut restored = thread(UUID_A, 50509, "start");
+        restored.cli = Cli::Codex;
+        restored.supersedes = Some(UUID_B.into());
+        restored.superseded_by = Some(UUID_C.into());
+        discard_links_given_argv(&mut restored, Some(APP_SERVER));
+        assert_eq!(restored.supersedes, None);
+        assert_eq!(restored.superseded_by, None);
+    }
+
+    #[test]
+    fn discards_persisted_codex_links_when_the_host_cannot_be_inspected() {
+        let mut restored = thread(UUID_A, 50509, "start");
+        restored.cli = Cli::Codex;
+        restored.supersedes = Some(UUID_B.into());
+        restored.superseded_by = Some(UUID_C.into());
+        discard_links_given_argv(&mut restored, None);
+        assert_eq!(restored.supersedes, None);
+        assert_eq!(restored.superseded_by, None);
+    }
+
+    #[test]
+    fn retains_persisted_links_for_a_dedicated_codex_process() {
+        let mut restored = thread(UUID_A, 4242, "start");
+        restored.cli = Cli::Codex;
+        restored.supersedes = Some(UUID_B.into());
+        restored.superseded_by = Some(UUID_C.into());
+        discard_links_given_argv(&mut restored, Some("/opt/homebrew/bin/codex --yolo"));
+        assert_eq!(restored.supersedes.as_deref(), Some(UUID_B));
+        assert_eq!(restored.superseded_by.as_deref(), Some(UUID_C));
+    }
+
+    #[test]
+    fn a_codex_tui_process_still_links_by_pid() {
+        let threads = codex_threads_on(4242, "start");
+        let ev = codex_event(UUID_B, 4242, "start");
+        assert_eq!(
+            predecessor_given_argv(
+                &ev,
+                Some("/opt/homebrew/bin/codex --yolo"),
+                &threads,
+                &no_owners()
+            ),
+            Some((Cli::Codex, UUID_A.to_string()))
+        );
+    }
+
+    #[test]
+    fn recognises_only_the_codex_app_server_as_a_shared_host() {
+        assert!(is_shared_session_host(APP_SERVER));
+        assert!(is_shared_session_host("codex app-server"));
+        assert!(!is_shared_session_host("/opt/homebrew/bin/codex --yolo"));
+        assert!(!is_shared_session_host("claude --resume app-server"));
+        assert!(!is_shared_session_host(""));
     }
 
     #[test]

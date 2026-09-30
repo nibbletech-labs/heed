@@ -242,6 +242,7 @@ fn restore_codex_roots(
         state.agents_active = 0;
         state.owner_product = None;
         state.owner_thread_id = None;
+        succession::discard_untrusted_restored_links(&mut state);
         roots.insert((Cli::Codex, state.thread_id.clone()), state);
     }
     roots
