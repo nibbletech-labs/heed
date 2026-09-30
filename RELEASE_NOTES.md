@@ -1,8 +1,7 @@
-## v0.4.3 — Keep Shared Codex Sessions Separate
+## v0.4.3 — Reliable Codex Session Tracking
 
-- Independent Codex sessions hosted by one app-server no longer inherit each other’s owner or disappear from their product’s thread panel.
-- Restarting the monitor discards incorrect shared-host succession links saved by older versions.
-- If the Codex host process cannot be inspected, Heed keeps the sessions separate. Dedicated Codex processes and Claude session rotation retain their existing behavior.
+- Codex sessions keep their own agents and activity when several sessions run at once.
+- Restarting Heed clears incorrect session links saved by older versions.
 
 ## v0.4.2 — Codex Agent Monitoring
 
