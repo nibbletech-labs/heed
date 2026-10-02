@@ -41,6 +41,9 @@ const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// polling — its event stream proves liveness.
 const LIVENESS_EVENT_GRACE: Duration = Duration::from_secs(120);
 /// State.json write debounce — coalesces a burst of events into one write.
+/// How often owners.json is aged (see `owners::age`). The first pass waits a
+/// full interval, so threads have re-registered their activity after a restart.
+const OWNER_AGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STATE_WRITE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Delay between TurnEnd and the post-Stop transcript scan, giving Claude
 /// time to flush the final assistant entry to disk.
@@ -488,6 +491,7 @@ fn run_loop(
         home.map(|home| codex_agents_worker(home, self_tx.clone()))
     };
     let mut next_agent_scan = Instant::now();
+    let mut next_owner_age = Instant::now() + OWNER_AGE_INTERVAL;
     let mut pending_write_at: Option<Instant> = None;
 
     loop {
@@ -582,6 +586,10 @@ fn run_loop(
                 let pruned = prune_records(&mut threads, state_writer::now_unix());
                 if polled || pruned {
                     schedule_write(&mut pending_write_at, now, cfg);
+                }
+                if now >= next_owner_age {
+                    next_owner_age = now + OWNER_AGE_INTERVAL;
+                    age_owners(&threads, &mut owners, &paths.owners_file);
                 }
             }
             Ok(DaemonEvent::PostStopScan { key, ts }) => {
@@ -770,6 +778,32 @@ fn handle_hook(
     }
 }
 
+/// Age owners.json against the threads the daemon is tracking, and adopt the
+/// result as the in-memory overlay when it changed.
+fn age_owners(
+    threads: &HashMap<ThreadKey, ThreadState>,
+    owners: &mut HashMap<ThreadKey, owners::OwnerRecord>,
+    owners_file: &Path,
+) {
+    let now = state_writer::now_unix();
+    let last_active = |key: &ThreadKey| {
+        threads.get(key).map(|s| match s.liveness {
+            Liveness::Gone => s.last_event as u64,
+            _ => now as u64,
+        })
+    };
+    match owners::age_file(owners_file, last_active, now as u64) {
+        Ok(Some((aged, dropped))) => {
+            if dropped > 0 {
+                info!("owners: dropped {dropped} records whose sessions are long gone");
+            }
+            *owners = aged;
+        }
+        Ok(None) => {}
+        Err(e) => warn!("owners: could not age owners.json: {e}"),
+    }
+}
+
 /// Hand the owner overlay to `key` when it has superseded the thread currently
 /// holding it. Ownership *moves*: a product's thread id must name exactly one
 /// native session, or a consumer diffing state.json would flap between the
@@ -801,6 +835,7 @@ fn transfer_owner_to_successor(
                 owner_product: parent.owner_product.clone(),
                 owner_thread_id: parent.owner_thread_id.clone(),
                 cwd: child.cwd.clone().or_else(|| parent.cwd.clone()),
+                seen_at: None,
             }
         }
         // The predecessor isn't tracked at all, so it hasn't emitted since this
@@ -819,6 +854,7 @@ fn transfer_owner_to_successor(
                 owner_product: rec.owner_product.clone(),
                 owner_thread_id: rec.owner_thread_id.clone(),
                 cwd: child.cwd.clone().or_else(|| rec.cwd.clone()),
+                seen_at: None,
             }
         }
     };
@@ -1118,6 +1154,7 @@ mod tests {
             transcript_path: None,
             agent_id: None,
             agent_type: None,
+            spawned_by: None,
             extra: HookEventExtra {
                 tool_name: tool.map(str::to_string),
                 ..Default::default()
@@ -1138,6 +1175,7 @@ mod tests {
             owner_product: Some("codezilla".into()),
             owner_thread_id: Some("cz-48".into()),
             cwd: Some("/repo".into()),
+            seen_at: None,
         };
         owners::register(&owners_file, Cli::Claude, PARENT, record.clone()).unwrap();
 
@@ -1198,6 +1236,7 @@ mod tests {
                 owner_product: Some("codezilla".into()),
                 owner_thread_id: Some("cz-48".into()),
                 cwd: Some("/repo".into()),
+                seen_at: None,
             },
         )
         .unwrap();
@@ -1820,6 +1859,7 @@ mod tests {
                 owner_product: Some("codezilla".into()),
                 owner_thread_id: Some("t-1".into()),
                 cwd: Some("/owned".into()),
+                seen_at: None,
             },
         );
         let threads = run_events_in_memory(events, owners);

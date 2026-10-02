@@ -272,6 +272,7 @@ mod tests {
             agent_color: None,
             own_activity: None,
             agents_active: 0,
+            spawned_by: None,
         }
     }
 
@@ -287,6 +288,7 @@ mod tests {
             transcript_path: None,
             agent_id: None,
             agent_type: None,
+            spawned_by: None,
             extra: Default::default(),
         }
     }

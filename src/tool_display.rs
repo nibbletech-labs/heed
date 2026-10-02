@@ -355,6 +355,7 @@ mod tests {
             agent_color: None,
             own_activity: None,
             agents_active: 0,
+            spawned_by: None,
         };
         assert_eq!(format_for_thread(&state), "Awaiting input");
         state.activity = Activity::Idle;
@@ -398,6 +399,7 @@ mod tests {
             agent_color: None,
             own_activity: None,
             agents_active: 0,
+            spawned_by: None,
         };
         assert_eq!(format_for_thread(&state), "Plan mode · Reading foo.rs");
         state.activity = Activity::AwaitingInput;

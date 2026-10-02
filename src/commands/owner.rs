@@ -31,6 +31,7 @@ pub fn register(args: RegisterArgs) -> Result<(), String> {
             owner_product: Some(args.owner_product),
             owner_thread_id: args.owner_thread_id,
             cwd: args.cwd,
+            seen_at: None,
         },
     )?;
     println!(

@@ -43,6 +43,7 @@ fn dummy_thread(id: &str) -> ThreadState {
         agent_color: None,
         own_activity: None,
         agents_active: 0,
+        spawned_by: None,
     }
 }
 

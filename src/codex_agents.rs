@@ -265,6 +265,7 @@ fn initial(meta: &Meta, root: &ThreadState, path: &Path) -> ThreadState {
         transcript_path: Some(path.to_string_lossy().into()),
         agent_id: Some(meta.id.clone()),
         agent_type: meta.role.clone(),
+        spawned_by: None,
         extra: HookEventExtra::default(),
     };
     let mut s = state::apply_agent_event(state::initial_agent_state(&ev), &ev);
@@ -296,6 +297,7 @@ fn event(
         transcript_path: s.transcript_path.clone(),
         agent_id: s.agent_id.clone(),
         agent_type: s.agent_type.clone(),
+        spawned_by: None,
         extra: HookEventExtra {
             tool_name: tool.map(str::to_owned),
             tool_target: target,

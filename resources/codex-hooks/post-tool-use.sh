@@ -53,7 +53,15 @@ if [ -n "$tool_name" ]; then
   extra="$extra"'}'
 fi
 
-printf '{"event":"tool_use","ts":%s,"cli":"codex","thread_id":"%s","pid":%s,"pid_start":"%s","cwd":"%s","transcript_path":"%s","extra":%s}\n' \
+# A Codex session started from inside a Claude Code session (a worker it
+# launched with `codex exec`, or via the Codex plugin) inherits that session's
+# id; record it so consumers can show the worker under the Claude session.
+spawned_by=""
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  spawned_by=',"spawned_by":"claude:'"$(printf '%s' "$CLAUDE_CODE_SESSION_ID" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"'"'
+fi
+
+printf '{"event":"tool_use","ts":%s,"cli":"codex","thread_id":"%s","pid":%s,"pid_start":"%s","cwd":"%s","transcript_path":"%s","extra":%s%s}\n' \
   "$ts" \
   "$(escape_json "$sid")" \
   "$ppid" \
@@ -61,4 +69,5 @@ printf '{"event":"tool_use","ts":%s,"cli":"codex","thread_id":"%s","pid":%s,"pid
   "$(escape_json "$cwd")" \
   "$(escape_json "$tpath")" \
   "$extra" \
+  "$spawned_by" \
   >> "$event_log"

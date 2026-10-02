@@ -301,6 +301,7 @@ mod tests {
             agent_color: None,
             own_activity: None,
             agents_active: 0,
+            spawned_by: None,
         }
     }
 
@@ -351,6 +352,7 @@ mod tests {
             agent_color: None,
             own_activity: None,
             agents_active: 0,
+            spawned_by: None,
         };
         let idle_new = make(Activity::Idle, 100.0);
         let working_new = make(Activity::Working, 90.0);

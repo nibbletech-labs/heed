@@ -30,10 +30,25 @@ fn script(cli: &str, name: &str) -> PathBuf {
 /// Returns the single JSON line that was appended to `$HOME/.heed/events.jsonl`,
 /// parsed as a `serde_json::Value`.
 fn run_hook(script_path: &Path, stdin: &str) -> serde_json::Value {
+    run_hook_in_claude(script_path, stdin, None)
+}
+
+/// [`run_hook`] as if launched from inside the Claude Code session
+/// `claude_session` (`None`: from outside any, whatever this test runs under).
+fn run_hook_in_claude(
+    script_path: &Path,
+    stdin: &str,
+    claude_session: Option<&str>,
+) -> serde_json::Value {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path();
 
-    let mut child = Command::new("bash")
+    let mut cmd = Command::new("bash");
+    match claude_session {
+        Some(id) => cmd.env("CLAUDE_CODE_SESSION_ID", id),
+        None => cmd.env_remove("CLAUDE_CODE_SESSION_ID"),
+    };
+    let mut child = cmd
         .arg(script_path)
         .env("HOME", home)
         .stdin(Stdio::piped())
@@ -335,6 +350,36 @@ fn codex_user_prompt_submit_emits_turn_start() {
     assert_eq!(v["event"], "turn_start");
     assert_eq!(v["cli"], "codex");
     assert_eq!(v["thread_id"], "019e1c62-3bf1-7322-b3e5-da99891037c3");
+}
+
+#[test]
+fn codex_session_launched_by_claude_records_its_spawner() {
+    for name in [
+        "user-prompt-submit.sh",
+        "pre-tool-use.sh",
+        "post-tool-use.sh",
+        "stop.sh",
+        "session-end.sh",
+    ] {
+        let v = run_hook_in_claude(
+            &script("codex", name),
+            &fixture("codex-user-prompt-submit.json"),
+            Some("b8cdbc51-5752-48b0-a1c7-f772e8a3cfc8"),
+        );
+        assert_eq!(
+            v["spawned_by"], "claude:b8cdbc51-5752-48b0-a1c7-f772e8a3cfc8",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn codex_session_outside_claude_has_no_spawner() {
+    let v = run_hook(
+        &script("codex", "stop.sh"),
+        &fixture("codex-user-prompt-submit.json"),
+    );
+    assert!(v.get("spawned_by").is_none());
 }
 
 #[test]

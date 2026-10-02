@@ -142,6 +142,10 @@ pub struct ThreadState {
     /// working right now.
     #[serde(default)]
     pub agents_active: u32,
+    /// Sessions: `"<cli>:<session id>"` of the session that launched this one
+    /// (see [`HookEvent::spawned_by`]). A consumer shows it under that session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<String>,
 }
 
 pub const RECENT_EVENTS_CAP: usize = 10;
@@ -195,6 +199,10 @@ pub struct HookEvent {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// `"<cli>:<session id>"` of the session that launched this one, when it
+    /// runs inside another CLI's session (a Codex worker started by Claude).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<String>,
     #[serde(default)]
     pub extra: HookEventExtra,
 }
@@ -290,6 +298,7 @@ pub fn initial_state(ev: &HookEvent) -> ThreadState {
         agent_color: None,
         own_activity: None,
         agents_active: 0,
+        spawned_by: HookEvent::truthy_string(&ev.spawned_by),
     }
 }
 
@@ -358,6 +367,9 @@ pub fn apply_event(mut state: ThreadState, ev: &HookEvent) -> ThreadState {
     }
     if let Some(c) = HookEvent::truthy_string(&ev.cwd) {
         state.cwd = Some(c);
+    }
+    if state.spawned_by.is_none() {
+        state.spawned_by = HookEvent::truthy_string(&ev.spawned_by);
     }
     state.liveness = Liveness::Live;
 
@@ -535,6 +547,7 @@ mod tests {
             transcript_path: Some("/transcript.jsonl".into()),
             agent_id: None,
             agent_type: None,
+            spawned_by: None,
             extra: HookEventExtra {
                 tool_name: tool.map(str::to_string),
                 tool_target: target.map(str::to_string),
@@ -543,6 +556,33 @@ mod tests {
                 todos_done: None,
             },
         }
+    }
+
+    #[test]
+    fn a_session_keeps_the_spawner_it_first_reported() {
+        let mut first = ev(HookEventKind::TurnStart, 1.0, None, None);
+        first.spawned_by = Some("claude:main".into());
+        let state = initial_state(&first);
+        assert_eq!(state.spawned_by.as_deref(), Some("claude:main"));
+
+        // Later events without it (or naming another) don't change it.
+        let state = apply_event(state, &ev(HookEventKind::ToolUse, 2.0, None, None));
+        let mut other = ev(HookEventKind::ToolUse, 3.0, None, None);
+        other.spawned_by = Some("claude:other".into());
+        let state = apply_event(state, &other);
+        assert_eq!(state.spawned_by.as_deref(), Some("claude:main"));
+    }
+
+    #[test]
+    fn a_spawner_reported_late_is_still_recorded() {
+        let state = initial_state(&ev(HookEventKind::TurnStart, 1.0, None, None));
+        assert_eq!(state.spawned_by, None);
+        let mut later = ev(HookEventKind::ToolUse, 2.0, None, None);
+        later.spawned_by = Some("claude:main".into());
+        assert_eq!(
+            apply_event(state, &later).spawned_by.as_deref(),
+            Some("claude:main")
+        );
     }
 
     fn ev_taskupdate(status: &str) -> HookEvent {

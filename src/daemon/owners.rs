@@ -23,11 +23,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::install::atomic_write;
 use crate::state::{Cli, ThreadKey};
 
+/// The overlay, keyed by native session.
+pub type Owners = HashMap<ThreadKey, OwnerRecord>;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerRecord {
     pub owner_product: Option<String>,
     pub owner_thread_id: Option<String>,
     pub cwd: Option<String>,
+    /// Unix seconds the record's session was last known to be in use: set on
+    /// register/transfer and refreshed by [`age`]. Absent on records written
+    /// before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<u64>,
+}
+
+/// A record whose session hasn't been seen for this long is dropped. Products
+/// re-register on every spawn, so this only clears sessions nobody will
+/// resume — without it the overlay grows by one entry per thread, forever.
+pub const OWNER_RETAIN_SECS: u64 = 14 * 86_400;
+/// `seen_at` is refreshed at most this often, so a live session doesn't
+/// rewrite owners.json on every aging pass.
+const SEEN_REFRESH_SECS: u64 = 86_400;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Compose the JSON key `"<cli>:<thread_id>"` used in owners.json.
@@ -116,6 +139,10 @@ fn quarantine(path: &Path) -> std::io::Result<()> {
 /// Insert or update an owner record. Atomic write.
 pub fn register(path: &Path, cli: Cli, thread_id: &str, record: OwnerRecord) -> Result<(), String> {
     let mut current = load(path).unwrap_or_default();
+    let record = OwnerRecord {
+        seen_at: Some(now_secs()),
+        ..record
+    };
     current.insert((cli, thread_id.to_string()), record);
     write(path, &current)
 }
@@ -132,8 +159,63 @@ pub fn transfer(
 ) -> Result<(), String> {
     let mut current = load(path).unwrap_or_default();
     current.remove(&(cli, from_thread_id.to_string()));
+    let record = OwnerRecord {
+        seen_at: Some(now_secs()),
+        ..record
+    };
     current.insert((cli, to_thread_id.to_string()), record);
     write(path, &current)
+}
+
+/// Age the overlay in place. `last_active` gives a record's session's latest
+/// activity (unix seconds) when the daemon tracks it — `now` for a live one —
+/// and `None` when it doesn't. A record takes the later of that and its
+/// `seen_at`; one with neither is stamped `now` (it predates `seen_at`), and
+/// one last seen over [`OWNER_RETAIN_SECS`] ago is removed. Returns whether
+/// anything changed.
+pub fn age(
+    map: &mut HashMap<ThreadKey, OwnerRecord>,
+    last_active: impl Fn(&ThreadKey) -> Option<u64>,
+    now: u64,
+) -> bool {
+    let mut changed = false;
+    map.retain(|key, rec| {
+        let seen = rec.seen_at.max(last_active(key));
+        let Some(seen) = seen else {
+            rec.seen_at = Some(now);
+            changed = true;
+            return true;
+        };
+        if now.saturating_sub(seen) > OWNER_RETAIN_SECS {
+            changed = true;
+            return false;
+        }
+        if seen >= rec.seen_at.unwrap_or(0) + SEEN_REFRESH_SECS {
+            rec.seen_at = Some(seen);
+            changed = true;
+        }
+        true
+    });
+    changed
+}
+
+/// [`age`] owners.json on disk, re-read fresh so a registration written since
+/// the daemon's last reload isn't lost. Returns the aged map when it changed
+/// (and was written) with how many records it dropped, `None` when nothing
+/// needed doing.
+pub fn age_file(
+    path: &Path,
+    last_active: impl Fn(&ThreadKey) -> Option<u64>,
+    now: u64,
+) -> Result<Option<(Owners, usize)>, String> {
+    let mut current = load(path)?;
+    let before = current.len();
+    if !age(&mut current, last_active, now) {
+        return Ok(None);
+    }
+    write(path, &current)?;
+    let dropped = before - current.len();
+    Ok(Some((current, dropped)))
 }
 
 /// Remove an owner entry. No-op if it doesn't exist. Atomic write.
@@ -273,10 +355,12 @@ mod tests {
                 owner_product: Some("codezilla".into()),
                 owner_thread_id: Some("t-1".into()),
                 cwd: Some("/work".into()),
+                seen_at: None,
             },
         )
         .unwrap();
         let m = load(&p).unwrap();
+        assert!(m[&(Cli::Claude, "abc".into())].seen_at.is_some());
         assert_eq!(
             m.get(&(Cli::Claude, "abc".into()))
                 .unwrap()
@@ -286,6 +370,69 @@ mod tests {
         );
         let removed = unregister(&p, Cli::Claude, "abc").unwrap();
         assert!(removed);
+        assert!(load(&p).unwrap().is_empty());
+    }
+
+    const DAY: u64 = 86_400;
+    const NOW: u64 = 100 * DAY;
+
+    fn rec(seen_at: Option<u64>) -> OwnerRecord {
+        OwnerRecord {
+            owner_product: Some("codezilla".into()),
+            owner_thread_id: Some("t".into()),
+            cwd: None,
+            seen_at,
+        }
+    }
+
+    fn key(id: &str) -> ThreadKey {
+        (Cli::Codex, id.to_string())
+    }
+
+    #[test]
+    fn age_stamps_legacy_records_instead_of_dropping_them() {
+        let mut m = HashMap::from([(key("legacy"), rec(None))]);
+        assert!(age(&mut m, |_| None, NOW));
+        assert_eq!(m[&key("legacy")].seen_at, Some(NOW));
+    }
+
+    #[test]
+    fn age_drops_records_unseen_past_retention() {
+        let mut m = HashMap::from([
+            (key("old"), rec(Some(NOW - 15 * DAY))),
+            (key("recent"), rec(Some(NOW - 13 * DAY))),
+        ]);
+        assert!(age(&mut m, |_| None, NOW));
+        assert!(!m.contains_key(&key("old")));
+        assert!(m.contains_key(&key("recent")));
+    }
+
+    #[test]
+    fn age_keeps_and_refreshes_a_tracked_session() {
+        // Registered long ago, but its session is live right now.
+        let mut m = HashMap::from([(key("live"), rec(Some(NOW - 30 * DAY)))]);
+        assert!(age(&mut m, |_| Some(NOW), NOW));
+        assert_eq!(m[&key("live")].seen_at, Some(NOW));
+    }
+
+    #[test]
+    fn age_leaves_a_freshly_seen_record_untouched() {
+        let mut m = HashMap::from([(key("fresh"), rec(Some(NOW - DAY / 2)))]);
+        assert!(!age(&mut m, |_| Some(NOW), NOW));
+        assert_eq!(m[&key("fresh")].seen_at, Some(NOW - DAY / 2));
+    }
+
+    #[test]
+    fn age_file_writes_only_when_something_changed() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("owners.json");
+        register(&p, Cli::Codex, "a", rec(None)).unwrap();
+        assert!(age_file(&p, |_| None, now_secs()).unwrap().is_none());
+        let (aged, dropped) = age_file(&p, |_| None, now_secs() + 15 * DAY)
+            .unwrap()
+            .unwrap();
+        assert!(aged.is_empty());
+        assert_eq!(dropped, 1);
         assert!(load(&p).unwrap().is_empty());
     }
 
